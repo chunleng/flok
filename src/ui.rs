@@ -130,9 +130,9 @@ impl App {
                                     writeln!(script, "{}", flock_process.command)?;
                                     let _ = script.persist(script_path.clone());
 
-                                    // TODO It's using zsh because my terminal is zsh. To make this
-                                    // use the login shell that the program is running on instead.
-                                    let mut cmd = CommandBuilder::new("zsh");
+                                    // Use the login shell from SHELL environment variable, fallback to sh
+                                    let shell = std::env::var("SHELL").unwrap_or("sh".to_string());
+                                    let mut cmd = CommandBuilder::new(shell);
                                     cmd.arg(script_path);
                                     cmd.cwd(std::env::current_dir()?);
 
