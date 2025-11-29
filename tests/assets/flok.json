@@ -1,5 +1,5 @@
 {
-    "flock": [
+    "flocks": [
         {
             "display_name": "dev",
             "processes": [
