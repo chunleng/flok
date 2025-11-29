@@ -1,17 +1,14 @@
 use std::io::Write;
 use std::{
-    cell::RefCell,
     collections::HashMap,
     io::Read,
-    process::{Child, Command, Stdio},
-    rc::Rc,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
 use anyhow::anyhow;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::widgets::Paragraph;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -20,7 +17,7 @@ use ratatui::{
     prelude::*,
     style::{Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 use tempfile::NamedTempFile;
 use tui_widget_list::{ListBuilder, ListState, ListView};
@@ -39,8 +36,9 @@ pub fn run(config: Config) -> Result<(), FlokProgramError> {
 }
 
 struct Process {
-    child: Child,
-    logs: Arc<RwLock<Vec<String>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    parser: Arc<RwLock<vt100::Parser>>,
 }
 
 struct App {
@@ -116,46 +114,69 @@ impl App {
                                 };
 
                                 if should_launch {
-                                    // Launch the process
+                                    // Launch the process using PTY for proper interactive support
+                                    let pty_system = native_pty_system();
+                                    let pair = pty_system
+                                        .openpty(PtySize {
+                                            rows: 24,
+                                            cols: 80,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                        })
+                                        .map_err(|e| anyhow!("Failed to open PTY: {}", e))?;
+
                                     let mut script = NamedTempFile::new()?;
                                     let script_path = script.path().display().to_string();
                                     writeln!(script, "{}", flock_process.command)?;
                                     let _ = script.persist(script_path.clone());
+
                                     // TODO It's using zsh because my terminal is zsh. To make this
                                     // use the login shell that the program is running on instead.
-                                    let mut child = Command::new("zsh")
-                                        .arg(script_path)
-                                        .stdout(Stdio::piped())
-                                        .spawn()?;
+                                    let mut cmd = CommandBuilder::new("zsh");
+                                    cmd.arg(script_path);
+                                    cmd.cwd(std::env::current_dir()?);
 
-                                    let stdout = child
-                                        .stdout
-                                        .take()
-                                        .ok_or(anyhow!("Unable to get stdout from command"))?;
+                                    let child = pair
+                                        .slave
+                                        .spawn_command(cmd)
+                                        .map_err(|e| anyhow!("Failed to spawn command: {}", e))?;
 
-                                    let logs = Arc::new(RwLock::new(vec![]));
-                                    let logs_clone = logs.clone();
+                                    let mut reader =
+                                        pair.master.try_clone_reader().map_err(|e| {
+                                            anyhow!("Failed to clone PTY reader: {}", e)
+                                        })?;
+
+                                    // Create a VT100 parser to handle terminal escape sequences
+                                    let parser =
+                                        Arc::new(RwLock::new(vt100::Parser::new(24, 80, 0)));
+                                    let parser_clone = parser.clone();
 
                                     std::thread::spawn(move || {
-                                        let stdout = Rc::new(RefCell::new(stdout));
                                         loop {
-                                            let mut buffer = [0; 20000];
-                                            let bytes_read =
-                                                stdout.borrow_mut().read(&mut buffer)?;
+                                            let mut buffer = [0; 8192];
+                                            let bytes_read = match reader.read(&mut buffer) {
+                                                Ok(n) => n,
+                                                Err(_) => break,
+                                            };
                                             if bytes_read == 0 {
-                                                return Ok::<(), std::io::Error>(());
+                                                break;
                                             }
-                                            buffer.split(|char| char == &b'\n').for_each(|buf| {
-                                                if !buf.iter().all(|c| c == &b'\0') {
-                                                    logs_clone.write().unwrap().push(
-                                                        String::from_utf8_lossy(&buf).to_string(),
-                                                    );
-                                                }
-                                            })
+                                            // Feed the output to the VT100 parser
+                                            parser_clone
+                                                .write()
+                                                .unwrap()
+                                                .process(&buffer[..bytes_read]);
                                         }
                                     });
 
-                                    processes.insert(process_idx, Process { child, logs });
+                                    processes.insert(
+                                        process_idx,
+                                        Process {
+                                            child,
+                                            pty_master: pair.master,
+                                            parser,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -220,22 +241,33 @@ impl Widget for &mut App {
                 // Check if this flock has processes and if this specific process exists
                 let process_option = self
                     .flock_processes
-                    .get(&selected_flock_idx)
-                    .and_then(|processes| processes.get(&process_idx));
+                    .get_mut(&selected_flock_idx)
+                    .and_then(|processes| processes.get_mut(&process_idx));
 
                 match process_option {
                     Some(process) => {
-                        let all_logs = process.logs.read().unwrap();
-                        let display_logs =
-                            &all_logs[all_logs.len().saturating_sub((layout.height - 2).into())..];
+                        // Resize PTY and parser to match the layout (accounting for borders)
+                        let pty_cols = layout.width.saturating_sub(2);
+                        let pty_rows = layout.height.saturating_sub(2);
+                        let _ = process.pty_master.resize(PtySize {
+                            rows: pty_rows,
+                            cols: pty_cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                        process.parser.write().unwrap().set_size(pty_rows, pty_cols);
+
+                        // Get the screen contents from the VT100 parser
+                        let parser = process.parser.read().unwrap();
+                        let screen = parser.screen();
+                        let contents = screen.contents();
+                        let lines: Vec<Line> = contents
+                            .lines()
+                            .map(|line| Line::from(line.to_string()))
+                            .collect();
+
                         Widget::render(
-                            Paragraph::new(
-                                display_logs
-                                    .iter()
-                                    .map(|x| Line::from(x.clone()))
-                                    .collect::<Vec<Line>>(),
-                            )
-                            .block(
+                            Paragraph::new(lines).block(
                                 Block::bordered().title(flock_process_config.display_name.clone()),
                             ),
                             overall_layout[process_idx],
