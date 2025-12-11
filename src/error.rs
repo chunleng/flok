@@ -16,7 +16,7 @@ pub enum FlokConfigError {
     #[error("An unknown IO error has occured: {0}")]
     UnknownStdIo(#[from] std::io::Error),
     #[error("An unknown SerDe error has occured: {0}")]
-    UnknownSerDe(#[from] serde_json::Error),
+    UnknownSerDe(#[from] serde_yaml::Error),
     #[error("Program crashed due to an unknown error")]
     Unknown(#[from] Box<dyn std::error::Error>),
 }

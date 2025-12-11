@@ -50,9 +50,9 @@ struct FlockProcess {
 }
 
 fn process_config(cli: Cli) -> Result<Config, FlokConfigError> {
-    let config_file = cli.config_file.unwrap_or("./.flok.json".into());
+    let config_file = cli.config_file.unwrap_or("./flok.yaml".into());
 
-    Ok(serde_json::from_reader(
+    Ok(serde_yaml::from_reader(
         File::open(config_file.clone()).map_err(move |_| {
             // TODO more fine grain error handling
             anyhow!(format!(

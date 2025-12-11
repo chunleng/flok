@@ -1,0 +1,11 @@
+flocks:
+  - display_name: dev
+    processes:
+      - display_name: docker compose
+        command: docker-compose -f ./tests/assets/docker-compose.yaml up
+      - display_name: print to 100
+        command: for i in `seq 1 100`; do echo $i; sleep 1; done
+  - display_name: dev with compose only
+    processes:
+      - display_name: docker compose
+        command: docker-compose -f ./tests/assets/docker-compose.yaml up
