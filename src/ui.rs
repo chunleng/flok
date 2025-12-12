@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::anyhow;
+use crossbeam_channel::{Receiver, unbounded};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
@@ -24,12 +25,15 @@ use tui_widget_list::{ListBuilder, ListState, ListView};
 
 use crate::{
     Config, Flock,
-    error::{FlokProgramError, FlokProgramExecutionError},
+    error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
+    watcher::{FileWatcher, WatcherEvent},
 };
 
 pub fn run(config: Config) -> Result<(), FlokProgramError> {
     let mut terminal = ratatui::init();
-    let app_result = App::new(config).run(&mut terminal);
+    let app_result = App::new(config)
+        .map_err(|e| FlokProgramError::Init(FlokProgramInitError::Unknown(e.into())))?
+        .run(&mut terminal);
     ratatui::restore();
 
     app_result
@@ -46,18 +50,29 @@ struct App {
     config: Config,
     flock_state: ListState,
     flock_processes: HashMap<usize, HashMap<usize, Process>>,
+    watcher_rx: Receiver<WatcherEvent>,
+    _file_watcher: FileWatcher,
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(config: Config) -> Result<Self, anyhow::Error> {
         let mut flock_state = ListState::default();
         flock_state.select(Some(0));
-        Self {
+
+        // Set up file watcher
+        let (watcher_tx, watcher_rx) = unbounded();
+        let cwd = std::env::current_dir()?;
+        let file_watcher = FileWatcher::new(&cwd, watcher_tx)
+            .map_err(|e| anyhow!("Failed to initialize file watcher: {}", e))?;
+
+        Ok(Self {
             exit: false,
             config,
             flock_state,
             flock_processes: HashMap::new(),
-        }
+            watcher_rx,
+            _file_watcher: file_watcher,
+        })
     }
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), FlokProgramError> {
         while !self.exit {
@@ -74,7 +89,40 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
+    fn handle_file_change(&mut self) -> Result<(), FlokProgramExecutionError> {
+        if let Some(flock_idx) = self.flock_state.selected {
+            let flock = self
+                .config
+                .flocks
+                .get(flock_idx)
+                .ok_or(anyhow!("Selected flock does not exist"))?;
+
+            // Get indices of processes that have watch enabled and are running
+            let processes_to_restart: Vec<usize> = flock
+                .processes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.watch)
+                .map(|(idx, _)| idx)
+                .collect();
+
+            // Temporary stub - just print that restart would happen
+            for process_idx in processes_to_restart {
+                println!(
+                    "Process will be restarting here: flock={}, process={}",
+                    flock_idx, process_idx
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn handle_event(&mut self) -> Result<(), FlokProgramExecutionError> {
+        // Check for file watcher events (non-blocking)
+        if let Ok(WatcherEvent::FileChanged) = self.watcher_rx.try_recv() {
+            self.handle_file_change()?;
+        }
+
         if poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => match (k.modifiers, k.code) {
