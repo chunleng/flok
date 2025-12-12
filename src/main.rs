@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 mod error;
 mod ui;
+mod watcher;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
