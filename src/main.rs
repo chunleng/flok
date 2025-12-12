@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 mod error;
 mod ui;
+mod watcher;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -47,6 +48,8 @@ struct Flock {
 struct FlockProcess {
     display_name: String,
     command: String,
+    #[serde(default)]
+    watch: bool,
 }
 
 fn process_config(cli: Cli) -> Result<Config, FlokConfigError> {
