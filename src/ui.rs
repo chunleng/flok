@@ -3,12 +3,14 @@ use std::{
     collections::HashMap,
     io::Read,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -46,7 +48,7 @@ enum ProcessState {
 }
 
 struct Process {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Arc<RwLock<Box<dyn portable_pty::Child + Send + Sync>>>,
     pty_master: Box<dyn portable_pty::MasterPty + Send>,
     parser: Arc<RwLock<vt100::Parser>>,
     state: ProcessState,
@@ -59,12 +61,16 @@ struct App {
     flock_processes: HashMap<usize, HashMap<usize, Process>>,
     watcher_rx: Option<Receiver<WatcherEvent>>,
     _file_watcher: Option<FileWatcher>,
+    shutdown_complete_rx: Receiver<(usize, usize)>,
+    shutdown_complete_tx: Sender<(usize, usize)>,
 }
 
 impl App {
     fn new(config: Config) -> Result<Self, anyhow::Error> {
         let mut flock_state = ListState::default();
         flock_state.select(Some(0));
+
+        let (shutdown_complete_tx, shutdown_complete_rx) = unbounded();
 
         Ok(Self {
             exit: false,
@@ -73,6 +79,8 @@ impl App {
             flock_processes: HashMap::new(),
             watcher_rx: None,
             _file_watcher: None,
+            shutdown_complete_rx,
+            shutdown_complete_tx,
         })
     }
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), FlokProgramError> {
@@ -185,7 +193,7 @@ impl App {
         processes.insert(
             process_idx,
             Process {
-                child,
+                child: Arc::new(RwLock::new(child)),
                 pty_master: pair.master,
                 parser,
                 state: ProcessState::Running,
@@ -195,30 +203,105 @@ impl App {
         Ok(())
     }
 
+    fn graceful_shutdown_async(
+        child: Arc<RwLock<Box<dyn portable_pty::Child + Send + Sync>>>,
+        timeout: Duration,
+        completion_sender: Sender<(usize, usize)>,
+        flock_idx: usize,
+        process_idx: usize,
+    ) {
+        std::thread::spawn(move || {
+            // Get the process ID
+            let pid = {
+                let child_lock = child.read().unwrap();
+                match child_lock.process_id() {
+                    Some(pid) => pid,
+                    None => {
+                        // No PID, notify completion and exit
+                        let _ = completion_sender.send((flock_idx, process_idx));
+                        return;
+                    }
+                }
+            };
+            let nix_pid = Pid::from_raw(pid as i32);
+
+            // Send SIGTERM
+            let _ = kill(nix_pid, Signal::SIGTERM);
+
+            // Wait for process to exit with timeout
+            let start = Instant::now();
+            loop {
+                let exit_status = {
+                    let mut child_lock = child.write().unwrap();
+                    child_lock.try_wait()
+                };
+
+                match exit_status {
+                    Ok(Some(_)) => {
+                        // Process exited, notify completion
+                        let _ = completion_sender.send((flock_idx, process_idx));
+                        return;
+                    }
+                    Ok(None) => {
+                        // Still running, check timeout
+                        if start.elapsed() >= timeout {
+                            // Timeout exceeded, send SIGKILL
+                            let _ = kill(nix_pid, Signal::SIGKILL);
+                            // Wait a bit for SIGKILL to take effect
+                            std::thread::sleep(Duration::from_millis(100));
+                            let _ = child.write().unwrap().try_wait();
+                            // Notify completion after SIGKILL
+                            let _ = completion_sender.send((flock_idx, process_idx));
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        // Error checking, assume exited, notify completion
+                        let _ = completion_sender.send((flock_idx, process_idx));
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     fn restart_process(
         &mut self,
         flock_idx: usize,
         process_idx: usize,
     ) -> Result<(), FlokProgramExecutionError> {
-        // Check if process exists and is running
-        let process_exists = self
+        // Check if process exists and get its current state
+        let process_state = self
             .flock_processes
             .get(&flock_idx)
             .and_then(|p| p.get(&process_idx))
-            .is_some();
+            .map(|p| p.state);
 
-        if !process_exists {
-            return Ok(());
+        match process_state {
+            None => return Ok(()),                           // Process doesn't exist
+            Some(ProcessState::Restarting) => return Ok(()), // Already restarting, skip
+            Some(ProcessState::Running) => {}                // OK to restart
         }
 
-        // Remove the old process (this kills it)
+        // Set state to Restarting and clone the child Arc for background shutdown
         if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
-            processes.remove(&process_idx);
+            if let Some(process) = processes.get_mut(&process_idx) {
+                process.state = ProcessState::Restarting;
+
+                // Spawn graceful shutdown in background thread (non-blocking)
+                // When complete, it will send a message to shutdown_complete_rx
+                Self::graceful_shutdown_async(
+                    process.child.clone(),
+                    Duration::from_secs(5),
+                    self.shutdown_complete_tx.clone(),
+                    flock_idx,
+                    process_idx,
+                );
+            }
         }
 
-        // Launch new process
-        self.launch_process(flock_idx, process_idx)?;
-
+        // Don't launch new process here - wait for shutdown completion
         Ok(())
     }
 
@@ -255,6 +338,17 @@ impl App {
             }
         }
 
+        // Check for shutdown completion events
+        if let Ok((flock_idx, process_idx)) = self.shutdown_complete_rx.try_recv() {
+            // Remove the old process (which is now terminated)
+            if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
+                processes.remove(&process_idx);
+            }
+
+            // Shutdown complete, now launch the new process
+            self.launch_process(flock_idx, process_idx)?;
+        }
+
         if poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => match (k.modifiers, k.code) {
@@ -283,7 +377,8 @@ impl App {
                                     .and_then(|p| p.get_mut(&process_idx))
                                     .map(|existing_process| {
                                         // Check if process has exited
-                                        match existing_process.child.try_wait() {
+                                        let mut child = existing_process.child.write().unwrap();
+                                        match child.try_wait() {
                                             Ok(Some(_)) => true, // Process has exited, relaunch
                                             Ok(None) => false,   // Process still running, skip
                                             Err(_) => true,      // Error checking status, relaunch
@@ -508,3 +603,4 @@ impl Widget for FlockItem {
             .render(area, buf);
     }
 }
+
