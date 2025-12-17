@@ -10,6 +10,12 @@ flocks:
           trap 'sleep 4' SIGTERM
           while true; do date; sleep 2; done
         watch: true
+      - display_name: graceful restart (custom debounce)
+        command: |
+          trap 'sleep 4' SIGTERM
+          while true; do date; sleep 2; done
+        watch:
+          debounce_seconds: 10
   - display_name: dev with compose only
     processes:
       - display_name: docker compose

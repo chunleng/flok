@@ -51,16 +51,24 @@ flocks:
     processes:
       - display_name: web server
         command: npm run dev
-        watch: true
+        watch: true  # Uses default 2 second debounce
+      - display_name: api server
+        command: npm run api
+        watch:
+          debounce_seconds: 5  # Custom debounce time
       - display_name: database
         command: docker-compose up db
         watch: false
 ```
 
 Configuration field:
-- `watch`: Boolean value to enable/disable file watching for this process (optional, default: `false`)
+- `watch`: Boolean or object to enable/disable file watching for this process (optional, default: `false`)
+  - `true`: Enables file watching with default value
+  - `false`: Disables file watching
+  - `watch.debounce_seconds`: Enables file watching with custom debounce time
+    (Default 1s)
 
-Only processes with `watch: true` will be automatically restarted when file changes are detected. Processes without this field or with `watch: false` will not be affected by file system events, though they can still be manually restarted via the Enter key.
+Only processes with `watch: true` or `watch: { debounce_seconds: N }` will be automatically restarted when file changes are detected. Processes without this field or with `watch: false` will not be affected by file system events, though they can still be manually restarted via the Enter key.
 
 ### Event Loop Integration
 
@@ -79,6 +87,17 @@ The process panel displays visual feedback when:
 - A process is being relaunched
 
 This helps users understand the current state of each process during the restart cycle.
+
+### Debounce Mechanism
+
+When file changes are detected, the application debounces restart events on a per-process basis:
+
+1. First file change detected: Start a debounce timer for the process
+2. Subsequent file changes within the debounce window: Reset the timer
+3. When timer expires without new changes: Trigger the process restart
+4. While debouncing: Additional file changes keep resetting the timer
+
+This prevents rapid successive restarts during bulk file operations (e.g., `git checkout`, mass edits) while still responding quickly to individual changes. Each process maintains its own debounce timer, allowing different processes to have different debounce settings based on their restart overhead.
 
 ## Challenges and Considerations
 
@@ -99,15 +118,3 @@ Possible solution: Use process groups and send signals to the entire group using
 Operating systems limit the number of file watches. For large projects, watching the entire directory tree may exceed these limits.
 
 Possible solution: Document the limitation and provide guidance on increasing system limits. Consider future enhancement to support glob patterns for selective watching.
-
-### Rapid File Changes
-
-Without debouncing, rapid file changes (e.g., during `git checkout` or mass file operations) will trigger multiple restarts in quick succession. This could lead to:
-- Processes constantly restarting and never stabilizing
-- High system resource usage
-- Poor user experience
-
-Possible solutions:
-- Track process state (running, terminating, starting) and ignore restart requests while already restarting
-- Queue at most one pending restart per process
-- Consider adding simple rate limiting (e.g., minimum time between restarts)

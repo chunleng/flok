@@ -41,10 +41,34 @@ pub fn run(config: Config) -> Result<(), FlokProgramError> {
     app_result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+struct DebounceTimer {
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl DebounceTimer {
+    fn new(duration: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            duration,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.started_at = Instant::now();
+    }
+
+    fn is_expired(&self) -> bool {
+        self.started_at.elapsed() >= self.duration
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum ProcessState {
     Running,
     Restarting,
+    RestartDebouncing(DebounceTimer),
 }
 
 struct Process {
@@ -116,7 +140,7 @@ impl App {
         process_idx: usize,
     ) -> Result<(), FlokProgramExecutionError> {
         // Get the process config and check watch flag before any borrows
-        let (command, watch) = {
+        let (command, watch_enabled) = {
             let flock = self
                 .config
                 .flocks
@@ -126,11 +150,14 @@ impl App {
                 .processes
                 .get(process_idx)
                 .ok_or(anyhow!("Process does not exist"))?;
-            (flock_process.command.clone(), flock_process.watch)
+            (
+                flock_process.command.clone(),
+                flock_process.watch.is_enabled(),
+            )
         };
 
         // Initialize watcher lazily if this is a watchable process
-        if watch {
+        if watch_enabled {
             self.ensure_watcher_initialized()?;
         }
 
@@ -276,12 +303,12 @@ impl App {
             .flock_processes
             .get(&flock_idx)
             .and_then(|p| p.get(&process_idx))
-            .map(|p| p.state);
+            .map(|p| p.state.clone());
 
         match process_state {
             None => return Ok(()),                           // Process doesn't exist
             Some(ProcessState::Restarting) => return Ok(()), // Already restarting, skip
-            Some(ProcessState::Running) => {}                // OK to restart
+            Some(ProcessState::Running) | Some(ProcessState::RestartDebouncing(_)) => {}
         }
 
         // Set state to Restarting and clone the child Arc for background shutdown
@@ -305,6 +332,26 @@ impl App {
         Ok(())
     }
 
+    fn process_debounce_timers(&mut self) -> Result<(), FlokProgramExecutionError> {
+        let mut to_restart = Vec::new();
+
+        for (flock_idx, processes) in &self.flock_processes {
+            for (process_idx, process) in processes.iter() {
+                if let ProcessState::RestartDebouncing(timer) = &process.state {
+                    if timer.is_expired() {
+                        to_restart.push((*flock_idx, *process_idx));
+                    }
+                }
+            }
+        }
+
+        for (flock_idx, process_idx) in to_restart {
+            self.restart_process(flock_idx, process_idx)?;
+        }
+
+        Ok(())
+    }
+
     fn handle_file_change(&mut self) -> Result<(), FlokProgramExecutionError> {
         if let Some(flock_idx) = self.flock_state.selected {
             let flock = self
@@ -313,18 +360,28 @@ impl App {
                 .get(flock_idx)
                 .ok_or(anyhow!("Selected flock does not exist"))?;
 
-            // Get indices of processes that have watch enabled
-            let processes_to_restart: Vec<usize> = flock
-                .processes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.watch)
-                .map(|(idx, _)| idx)
-                .collect();
+            for (process_idx, process_config) in flock.processes.iter().enumerate() {
+                if !process_config.watch.is_enabled() {
+                    continue;
+                }
 
-            // Restart each watchable process
-            for process_idx in processes_to_restart {
-                self.restart_process(flock_idx, process_idx)?;
+                if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
+                    if let Some(process) = processes.get_mut(&process_idx) {
+                        let debounce_duration = process_config.watch.debounce_duration();
+
+                        match &mut process.state {
+                            ProcessState::Running => {
+                                process.state = ProcessState::RestartDebouncing(
+                                    DebounceTimer::new(debounce_duration),
+                                );
+                            }
+                            ProcessState::RestartDebouncing(timer) => {
+                                timer.reset();
+                            }
+                            ProcessState::Restarting => {}
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -337,6 +394,9 @@ impl App {
                 self.handle_file_change()?;
             }
         }
+
+        // Process expired debounce timers
+        self.process_debounce_timers()?;
 
         // Check for shutdown completion events
         if let Ok((flock_idx, process_idx)) = self.shutdown_complete_rx.try_recv() {
@@ -531,9 +591,9 @@ impl Widget for &mut App {
                             .collect();
 
                         // Build title with state indicator
-                        let state_indicator = match process.state {
-                            ProcessState::Running => "",
+                        let state_indicator = match &process.state {
                             ProcessState::Restarting => " [Restarting...]",
+                            _ => "",
                         };
                         let title =
                             format!("{}{}", flock_process_config.display_name, state_indicator);
@@ -603,4 +663,3 @@ impl Widget for FlockItem {
             .render(area, buf);
     }
 }
-
