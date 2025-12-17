@@ -1,4 +1,4 @@
-use std::{fs::File, path::PathBuf};
+use std::{fs::File, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
@@ -45,11 +45,43 @@ struct Flock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum WatchConfig {
+    Enabled(bool),
+    WithDebounce { debounce_seconds: Option<f64> },
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        WatchConfig::Enabled(false)
+    }
+}
+
+impl WatchConfig {
+    fn is_enabled(&self) -> bool {
+        match self {
+            WatchConfig::Enabled(enabled) => *enabled,
+            WatchConfig::WithDebounce { .. } => true,
+        }
+    }
+
+    fn debounce_duration(&self) -> Duration {
+        match self {
+            WatchConfig::Enabled(true) => Duration::from_secs(2),
+            WatchConfig::Enabled(false) => Duration::from_secs(0),
+            WatchConfig::WithDebounce { debounce_seconds } => {
+                Duration::from_secs_f64(debounce_seconds.unwrap_or(1.0))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct FlockProcess {
     display_name: String,
     command: String,
     #[serde(default)]
-    watch: bool,
+    watch: WatchConfig,
 }
 
 fn process_config(cli: Cli) -> Result<Config, FlokConfigError> {
