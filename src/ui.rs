@@ -26,7 +26,7 @@ use tempfile::NamedTempFile;
 use tui_widget_list::{ListBuilder, ListState, ListView};
 
 use crate::{
-    AppConfig, Flock,
+    config::{AppConfig, FlockConfig},
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
     watcher::{FileWatcher, WatcherEvent},
 };
@@ -643,12 +643,12 @@ fn ansi_to_ratatui_color(idx: u8) -> ratatui::style::Color {
 
 #[derive(Debug, Clone)]
 struct FlockItem {
-    flock: Flock,
+    flock: FlockConfig,
     style: Style,
 }
 
 impl FlockItem {
-    fn new(flock: Flock) -> Self {
+    fn new(flock: FlockConfig) -> Self {
         Self {
             flock,
             style: Style::default(),
