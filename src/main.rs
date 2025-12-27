@@ -34,7 +34,7 @@ fn main() {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct Config {
+struct AppConfig {
     flocks: Vec<Flock>,
 }
 
@@ -84,7 +84,7 @@ struct FlockProcess {
     watch: WatchConfig,
 }
 
-fn process_config(cli: Cli) -> Result<Config, FlokConfigError> {
+fn process_config(cli: Cli) -> Result<AppConfig, FlokConfigError> {
     let config_file = cli.config_file.unwrap_or("./flok.yaml".into());
 
     Ok(serde_yaml::from_reader(

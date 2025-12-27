@@ -26,12 +26,12 @@ use tempfile::NamedTempFile;
 use tui_widget_list::{ListBuilder, ListState, ListView};
 
 use crate::{
-    Config, Flock,
+    AppConfig, Flock,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
     watcher::{FileWatcher, WatcherEvent},
 };
 
-pub fn run(config: Config) -> Result<(), FlokProgramError> {
+pub fn run(config: AppConfig) -> Result<(), FlokProgramError> {
     let mut terminal = ratatui::init();
     let app_result = App::new(config)
         .map_err(|e| FlokProgramError::Init(FlokProgramInitError::Unknown(e.into())))?
@@ -80,7 +80,7 @@ struct Process {
 
 struct App {
     exit: bool,
-    config: Config,
+    config: AppConfig,
     flock_state: ListState,
     flock_processes: HashMap<usize, HashMap<usize, Process>>,
     watcher_rx: Option<Receiver<WatcherEvent>>,
@@ -90,7 +90,7 @@ struct App {
 }
 
 impl App {
-    fn new(config: Config) -> Result<Self, anyhow::Error> {
+    fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         let mut flock_state = ListState::default();
         flock_state.select(Some(0));
 
