@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 mod config;
 mod error;
 mod ui;
-mod watcher;
+mod utils;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]

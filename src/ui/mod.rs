@@ -1,8 +1,5 @@
 mod components;
-use std::io::Write;
 use std::{
-    collections::HashMap,
-    io::Read,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -12,7 +9,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::widgets::ListState;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -22,15 +18,18 @@ use ratatui::{
     prelude::*,
     widgets::Widget,
 };
-use tempfile::NamedTempFile;
 
-use crate::ui::components::lists::{SideListView, SplitListView};
-use crate::ui::components::pty::AutoFillPty;
+use crate::utils::file_watcher::{DebounceTimer, WatcherEvent};
+use crate::utils::process::{ProcessState, ProcessStatus};
 use crate::{
     config::AppConfig,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
-    watcher::{FileWatcher, WatcherEvent},
 };
+use crate::{
+    ui::components::lists::{SideListView, SplitListView},
+    utils::file_watcher::{FILE_WATCHER, FileWatcherStatus},
+};
+use crate::{ui::components::pty::AutoFillPty, utils::process::ProcessRunningStatus};
 
 pub fn run(config: AppConfig) -> Result<(), FlokProgramError> {
     let mut terminal = ratatui::init();
@@ -42,50 +41,11 @@ pub fn run(config: AppConfig) -> Result<(), FlokProgramError> {
     app_result
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct DebounceTimer {
-    started_at: Instant,
-    duration: Duration,
-}
-
-impl DebounceTimer {
-    fn new(duration: Duration) -> Self {
-        Self {
-            started_at: Instant::now(),
-            duration,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.started_at = Instant::now();
-    }
-
-    fn is_expired(&self) -> bool {
-        self.started_at.elapsed() >= self.duration
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ProcessState {
-    Running,
-    Restarting,
-    RestartDebouncing(DebounceTimer),
-}
-
-struct Process {
-    child: Arc<RwLock<Box<dyn portable_pty::Child + Send + Sync>>>,
-    pty_master: Arc<Box<dyn portable_pty::MasterPty + Send>>,
-    parser: Arc<RwLock<vt100::Parser>>,
-    state: ProcessState,
-}
-
 struct App {
     exit: bool,
     config: AppConfig,
     flock_state: ListState,
-    flock_processes: HashMap<usize, HashMap<usize, Process>>,
-    watcher_rx: Option<Receiver<WatcherEvent>>,
-    _file_watcher: Option<FileWatcher>,
+    flock_processes: Vec<Vec<ProcessState>>,
     shutdown_complete_rx: Receiver<(usize, usize)>,
     shutdown_complete_tx: Sender<(usize, usize)>,
 }
@@ -94,6 +54,17 @@ impl App {
     fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
         let mut flock_state = ListState::default();
         flock_state.select(Some(0));
+        let flock_processes: Vec<Vec<_>> = config
+            .flocks
+            .iter()
+            .map(|flock_cfg| {
+                flock_cfg
+                    .processes
+                    .iter()
+                    .map(|process_cfg| ProcessState::new(process_cfg.clone()))
+                    .collect()
+            })
+            .collect();
 
         let (shutdown_complete_tx, shutdown_complete_rx) = unbounded();
 
@@ -101,9 +72,7 @@ impl App {
             exit: false,
             config,
             flock_state,
-            flock_processes: HashMap::new(),
-            watcher_rx: None,
-            _file_watcher: None,
+            flock_processes,
             shutdown_complete_rx,
             shutdown_complete_tx,
         })
@@ -121,114 +90,6 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         frame.render_widget(self, frame.area());
-    }
-
-    fn ensure_watcher_initialized(&mut self) -> Result<(), FlokProgramExecutionError> {
-        if self._file_watcher.is_none() {
-            let (watcher_tx, watcher_rx) = unbounded();
-            let cwd = std::env::current_dir()?;
-            let file_watcher = FileWatcher::new(&cwd, watcher_tx)
-                .map_err(|e| anyhow!("Failed to initialize file watcher: {}", e))?;
-            self.watcher_rx = Some(watcher_rx);
-            self._file_watcher = Some(file_watcher);
-        }
-        Ok(())
-    }
-
-    fn launch_process(
-        &mut self,
-        flock_idx: usize,
-        process_idx: usize,
-    ) -> Result<(), FlokProgramExecutionError> {
-        // Get the process config and check watch flag before any borrows
-        let (command, watch_enabled) = {
-            let flock = self
-                .config
-                .flocks
-                .get(flock_idx)
-                .ok_or(anyhow!("Flock does not exist"))?;
-            let flock_process = flock
-                .processes
-                .get(process_idx)
-                .ok_or(anyhow!("Process does not exist"))?;
-            (
-                flock_process.command.clone(),
-                flock_process.watch.is_enabled(),
-            )
-        };
-
-        // Initialize watcher lazily if this is a watchable process
-        if watch_enabled {
-            self.ensure_watcher_initialized()?;
-        }
-
-        let processes = self
-            .flock_processes
-            .entry(flock_idx)
-            .or_insert_with(HashMap::new);
-
-        // Launch the process using PTY for proper interactive support
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| anyhow!("Failed to open PTY: {}", e))?;
-
-        let mut script = NamedTempFile::new()?;
-        let script_path = script.path().display().to_string();
-        writeln!(script, "{}", command)?;
-        let _ = script.persist(script_path.clone());
-
-        // Use the login shell from SHELL environment variable, fallback to sh
-        let shell = std::env::var("SHELL").unwrap_or("sh".to_string());
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg(script_path);
-        cmd.cwd(std::env::current_dir()?);
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| anyhow!("Failed to spawn command: {}", e))?;
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| anyhow!("Failed to clone PTY reader: {}", e))?;
-
-        // Create a VT100 parser to handle terminal escape sequences
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(24, 80, 0)));
-        let parser_clone = parser.clone();
-
-        std::thread::spawn(move || {
-            loop {
-                let mut buffer = [0; 8192];
-                let bytes_read = match reader.read(&mut buffer) {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if bytes_read == 0 {
-                    break;
-                }
-                // Feed the output to the VT100 parser
-                parser_clone.write().unwrap().process(&buffer[..bytes_read]);
-            }
-        });
-
-        processes.insert(
-            process_idx,
-            Process {
-                child: Arc::new(RwLock::new(child)),
-                pty_master: Arc::new(pair.master),
-                parser,
-                state: ProcessState::Running,
-            },
-        );
-
-        Ok(())
     }
 
     fn graceful_shutdown_async(
@@ -299,33 +160,24 @@ impl App {
         flock_idx: usize,
         process_idx: usize,
     ) -> Result<(), FlokProgramExecutionError> {
-        // Check if process exists and get its current state
-        let process_state = self
-            .flock_processes
-            .get(&flock_idx)
-            .and_then(|p| p.get(&process_idx))
-            .map(|p| p.state.clone());
-
-        match process_state {
-            None => return Ok(()),                           // Process doesn't exist
-            Some(ProcessState::Restarting) => return Ok(()), // Already restarting, skip
-            Some(ProcessState::Running) | Some(ProcessState::RestartDebouncing(_)) => {}
-        }
-
         // Set state to Restarting and clone the child Arc for background shutdown
-        if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
-            if let Some(process) = processes.get_mut(&process_idx) {
-                process.state = ProcessState::Restarting;
+        if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
+            if let Some(state) = processes.get_mut(process_idx) {
+                if let ProcessStatus::Running(process) = &mut state.status {
+                    if let ProcessRunningStatus::Debouncing(_) = process.status {
+                        process.status = ProcessRunningStatus::Restarting;
 
-                // Spawn graceful shutdown in background thread (non-blocking)
-                // When complete, it will send a message to shutdown_complete_rx
-                Self::graceful_shutdown_async(
-                    process.child.clone(),
-                    Duration::from_secs(5),
-                    self.shutdown_complete_tx.clone(),
-                    flock_idx,
-                    process_idx,
-                );
+                        // Spawn graceful shutdown in background thread (non-blocking)
+                        // When complete, it will send a message to shutdown_complete_rx
+                        Self::graceful_shutdown_async(
+                            process.child.clone(),
+                            Duration::from_secs(5),
+                            self.shutdown_complete_tx.clone(),
+                            flock_idx,
+                            process_idx,
+                        );
+                    }
+                }
             }
         }
 
@@ -336,11 +188,13 @@ impl App {
     fn process_debounce_timers(&mut self) -> Result<(), FlokProgramExecutionError> {
         let mut to_restart = Vec::new();
 
-        for (flock_idx, processes) in &self.flock_processes {
-            for (process_idx, process) in processes.iter() {
-                if let ProcessState::RestartDebouncing(timer) = &process.state {
-                    if timer.is_expired() {
-                        to_restart.push((*flock_idx, *process_idx));
+        for (flock_idx, processes) in self.flock_processes.iter().enumerate() {
+            for (process_idx, process_state) in processes.iter().enumerate() {
+                if let ProcessStatus::Running(process) = &process_state.status {
+                    if let ProcessRunningStatus::Debouncing(timer) = &process.status {
+                        if timer.is_expired() {
+                            to_restart.push((flock_idx, process_idx));
+                        }
                     }
                 }
             }
@@ -366,20 +220,23 @@ impl App {
                     continue;
                 }
 
-                if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
-                    if let Some(process) = processes.get_mut(&process_idx) {
+                if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
+                    if let Some(state) = processes.get_mut(process_idx) {
                         let debounce_duration = process_config.watch.debounce_duration();
 
-                        match &mut process.state {
-                            ProcessState::Running => {
-                                process.state = ProcessState::RestartDebouncing(
-                                    DebounceTimer::new(debounce_duration),
-                                );
-                            }
-                            ProcessState::RestartDebouncing(timer) => {
-                                timer.reset();
-                            }
-                            ProcessState::Restarting => {}
+                        match &mut state.status {
+                            ProcessStatus::Stopped => {}
+                            ProcessStatus::Running(process) => match &mut process.status {
+                                ProcessRunningStatus::Stable => {
+                                    process.status = ProcessRunningStatus::Debouncing(
+                                        DebounceTimer::new(debounce_duration),
+                                    );
+                                }
+                                ProcessRunningStatus::Debouncing(timer) => {
+                                    timer.reset();
+                                }
+                                ProcessRunningStatus::Restarting => {}
+                            },
                         }
                     }
                 }
@@ -390,9 +247,14 @@ impl App {
 
     fn handle_event(&mut self) -> Result<(), FlokProgramExecutionError> {
         // Check for file watcher events only if watcher is initialized
-        if let Some(rx) = &self.watcher_rx {
-            if let Ok(WatcherEvent::FileChanged) = rx.try_recv() {
-                self.handle_file_change()?;
+        if let Ok(watcher) = FILE_WATCHER.read() {
+            match *watcher {
+                FileWatcherStatus::Enabled(ref watcher) => {
+                    if let Ok(WatcherEvent::FileChanged) = watcher.watcher_rx.try_recv() {
+                        self.handle_file_change()?;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -402,12 +264,11 @@ impl App {
         // Check for shutdown completion events
         if let Ok((flock_idx, process_idx)) = self.shutdown_complete_rx.try_recv() {
             // Remove the old process (which is now terminated)
-            if let Some(processes) = self.flock_processes.get_mut(&flock_idx) {
-                processes.remove(&process_idx);
+            if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
+                if let Some(process) = processes.get_mut(process_idx) {
+                    process.launch().unwrap();
+                }
             }
-
-            // Shutdown complete, now launch the new process
-            self.launch_process(flock_idx, process_idx)?;
         }
 
         if poll(Duration::from_millis(100))? {
@@ -425,32 +286,13 @@ impl App {
                     }
                     (KeyModifiers::NONE, KeyCode::Enter) => {
                         if let Some(flock_idx) = self.flock_state.selected() {
-                            let flock =
-                                self.config.flocks.get(flock_idx).ok_or(anyhow!(
-                                    "Selected a flock that does not exist anymore"
-                                ))?;
-
-                            // Iterate through each process in the flock
-                            for process_idx in 0..flock.processes.len() {
-                                let should_launch = self
-                                    .flock_processes
-                                    .get_mut(&flock_idx)
-                                    .and_then(|p| p.get_mut(&process_idx))
-                                    .map(|existing_process| {
-                                        // Check if process has exited
-                                        let mut child = existing_process.child.write().unwrap();
-                                        match child.try_wait() {
-                                            Ok(Some(_)) => true, // Process has exited, relaunch
-                                            Ok(None) => false,   // Process still running, skip
-                                            Err(_) => true,      // Error checking status, relaunch
-                                        }
-                                    })
-                                    .unwrap_or(true); // Process was never launched
-
-                                if should_launch {
-                                    self.launch_process(flock_idx, process_idx)?;
-                                }
-                            }
+                            self.flock_processes
+                                .get_mut(flock_idx)
+                                .expect("Flock should exists, but didn't")
+                                .iter_mut()
+                                .for_each(|x| {
+                                    x.launch().unwrap();
+                                });
                         }
                     }
                     _ => {}
@@ -464,10 +306,10 @@ impl App {
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let overall_layout = Layout::default()
+        let [sidebar_area, main_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(20), Constraint::Fill(1)])
-            .split(area);
+            .areas(area);
         SideListView::new(
             "Flocks".to_string(),
             self.config
@@ -476,46 +318,37 @@ impl Widget for &mut App {
                 .map(|f| f.display_name.to_owned())
                 .collect(),
         )
-        .render(overall_layout[0], buf, &mut self.flock_state);
+        .render(sidebar_area, buf, &mut self.flock_state);
 
         // Display processes for the selected flock
         if let Some(selected_flock_idx) = self.flock_state.selected() {
-            let flock_process_configs = &self
-                .config
-                .flocks
+            let mut widgets = Vec::new();
+            self.flock_processes
                 .get(selected_flock_idx)
                 .unwrap()
-                .processes;
-            let mut widgets = Vec::new();
-            // Render each process panel
-            for (process_idx, flock_process_config) in flock_process_configs.iter().enumerate() {
-                // Check if this flock has processes and if this specific process exists
-                let process_option = self
-                    .flock_processes
-                    .get_mut(&selected_flock_idx)
-                    .and_then(|processes| processes.get_mut(&process_idx));
+                .iter()
+                .for_each(|state| {
+                    match state.status {
+                        ProcessStatus::Running(ref process) => {
+                            // Build title with state indicator
+                            let state_indicator = match &process.status {
+                                ProcessRunningStatus::Restarting => " [Restarting...]",
+                                _ => "",
+                            };
+                            let title =
+                                format!("{}{}", state.process_config.display_name, state_indicator);
 
-                match process_option {
-                    Some(process) => {
-                        // Build title with state indicator
-                        let state_indicator = match &process.state {
-                            ProcessState::Restarting => " [Restarting...]",
-                            _ => "",
-                        };
-                        let title =
-                            format!("{}{}", flock_process_config.display_name, state_indicator);
-
-                        widgets.push(AutoFillPty::new(
-                            process.pty_master.clone(),
-                            process.parser.clone(),
-                            title,
-                        ));
+                            widgets.push(AutoFillPty::new(
+                                process.pty_master.clone(),
+                                process.parser.clone(),
+                                title,
+                            ));
+                        }
+                        _ => {}
                     }
-                    None => {}
-                }
-            }
+                });
 
-            SplitListView::new(widgets).render(overall_layout[1], buf)
+            SplitListView::new(widgets).render(main_area, buf)
         }
     }
 }
