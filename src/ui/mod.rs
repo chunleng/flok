@@ -1,3 +1,4 @@
+mod components;
 use std::io::Write;
 use std::{
     collections::HashMap,
@@ -12,6 +13,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use ratatui::widgets::ListState;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -20,13 +22,13 @@ use ratatui::{
     prelude::*,
     style::{Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Paragraph, Widget},
 };
 use tempfile::NamedTempFile;
-use tui_widget_list::{ListBuilder, ListState, ListView};
 
+use crate::ui::components::lists::SideListView;
 use crate::{
-    config::{AppConfig, FlockConfig},
+    config::AppConfig,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
     watcher::{FileWatcher, WatcherEvent},
 };
@@ -353,7 +355,7 @@ impl App {
     }
 
     fn handle_file_change(&mut self) -> Result<(), FlokProgramExecutionError> {
-        if let Some(flock_idx) = self.flock_state.selected {
+        if let Some(flock_idx) = self.flock_state.selected() {
             let flock = self
                 .config
                 .flocks
@@ -417,13 +419,13 @@ impl App {
                         self.exit = true;
                     }
                     (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => {
-                        self.flock_state.next();
+                        self.flock_state.select_next();
                     }
                     (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => {
-                        self.flock_state.previous();
+                        self.flock_state.select_previous();
                     }
                     (KeyModifiers::NONE, KeyCode::Enter) => {
-                        if let Some(flock_idx) = self.flock_state.selected {
+                        if let Some(flock_idx) = self.flock_state.selected() {
                             let flock =
                                 self.config.flocks.get(flock_idx).ok_or(anyhow!(
                                     "Selected a flock that does not exist anymore"
@@ -467,28 +469,18 @@ impl Widget for &mut App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(20), Constraint::Fill(1)])
             .split(area);
-        let title_style = Style::new().bold();
-        let list_builder = ListBuilder::new(|context| {
-            // TODO change unwrap
-            let mut item =
-                FlockItem::new(self.config.flocks.get(context.index).unwrap().to_owned());
-            if context.is_selected {
-                item.style = item.style.reversed();
-            }
-
-            (item, 1)
-        });
-        ListView::new(list_builder, self.config.flocks.len())
-            .block(
-                Block::new()
-                    .borders(Borders::RIGHT)
-                    .title_top("Flocks")
-                    .title_style(title_style),
-            )
-            .render(overall_layout[0], buf, &mut self.flock_state);
+        SideListView::new(
+            "Flocks".to_string(),
+            self.config
+                .flocks
+                .iter()
+                .map(|f| f.display_name.to_owned())
+                .collect(),
+        )
+        .render(overall_layout[0], buf, &mut self.flock_state);
 
         // Display processes for the selected flock
-        if let Some(selected_flock_idx) = self.flock_state.selected {
+        if let Some(selected_flock_idx) = self.flock_state.selected() {
             let flock_process_configs = &self
                 .config
                 .flocks
@@ -638,28 +630,5 @@ fn ansi_to_ratatui_color(idx: u8) -> ratatui::style::Color {
         14 => Color::LightCyan,
         15 => Color::White,
         _ => Color::Reset,
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FlockItem {
-    flock: FlockConfig,
-    style: Style,
-}
-
-impl FlockItem {
-    fn new(flock: FlockConfig) -> Self {
-        Self {
-            flock,
-            style: Style::default(),
-        }
-    }
-}
-
-impl Widget for FlockItem {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Line::from(self.flock.display_name)
-            .style(self.style)
-            .render(area, buf);
     }
 }
