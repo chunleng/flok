@@ -20,13 +20,12 @@ use ratatui::{
     crossterm::event::poll,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
-    style::{Style, Stylize},
-    text::Line,
-    widgets::{Block, Paragraph, Widget},
+    widgets::Widget,
 };
 use tempfile::NamedTempFile;
 
-use crate::ui::components::lists::SideListView;
+use crate::ui::components::lists::{SideListView, SplitListView};
+use crate::ui::components::pty::AutoFillPty;
 use crate::{
     config::AppConfig,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
@@ -75,7 +74,7 @@ enum ProcessState {
 
 struct Process {
     child: Arc<RwLock<Box<dyn portable_pty::Child + Send + Sync>>>,
-    pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    pty_master: Arc<Box<dyn portable_pty::MasterPty + Send>>,
     parser: Arc<RwLock<vt100::Parser>>,
     state: ProcessState,
 }
@@ -223,7 +222,7 @@ impl App {
             process_idx,
             Process {
                 child: Arc::new(RwLock::new(child)),
-                pty_master: pair.master,
+                pty_master: Arc::new(pair.master),
                 parser,
                 state: ProcessState::Running,
             },
@@ -487,20 +486,9 @@ impl Widget for &mut App {
                 .get(selected_flock_idx)
                 .unwrap()
                 .processes;
-
-            let overall_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    (0..flock_process_configs.len())
-                        .map(|_| Constraint::Fill(1))
-                        .collect::<Vec<Constraint>>(),
-                )
-                .split(overall_layout[1]);
-
+            let mut widgets = Vec::new();
             // Render each process panel
             for (process_idx, flock_process_config) in flock_process_configs.iter().enumerate() {
-                let layout = overall_layout[process_idx];
-
                 // Check if this flock has processes and if this specific process exists
                 let process_option = self
                     .flock_processes
@@ -509,79 +497,6 @@ impl Widget for &mut App {
 
                 match process_option {
                     Some(process) => {
-                        // Resize PTY and parser to match the layout (accounting for borders)
-                        let pty_cols = layout.width.saturating_sub(2);
-                        let pty_rows = layout.height.saturating_sub(2);
-                        let _ = process.pty_master.resize(PtySize {
-                            rows: pty_rows,
-                            cols: pty_cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
-                        process.parser.write().unwrap().set_size(pty_rows, pty_cols);
-
-                        // Get the screen contents from the VT100 parser with colors
-                        let parser = process.parser.read().unwrap();
-                        let screen = parser.screen();
-
-                        let lines: Vec<Line> = (0..pty_rows)
-                            .map(|row| {
-                                let mut spans = vec![];
-                                let mut current_text = String::new();
-                                let mut current_style = Style::default();
-
-                                for col in 0..pty_cols {
-                                    let cell = screen.cell(row, col);
-                                    if let Some(cell) = cell {
-                                        let fg = cell.fgcolor();
-                                        let bg = cell.bgcolor();
-                                        let is_bold = cell.bold();
-                                        let is_italic = cell.italic();
-                                        let is_underline = cell.underline();
-
-                                        let mut style = Style::default();
-
-                                        // Convert VT100 colors to Ratatui colors
-                                        if let vt100::Color::Idx(idx) = fg {
-                                            style = style.fg(ansi_to_ratatui_color(idx));
-                                        }
-                                        if let vt100::Color::Idx(idx) = bg {
-                                            style = style.bg(ansi_to_ratatui_color(idx));
-                                        }
-                                        if is_bold {
-                                            style = style.bold();
-                                        }
-                                        if is_italic {
-                                            style = style.italic();
-                                        }
-                                        if is_underline {
-                                            style = style.underlined();
-                                        }
-
-                                        if style != current_style && !current_text.is_empty() {
-                                            spans.push(ratatui::text::Span::styled(
-                                                current_text.clone(),
-                                                current_style,
-                                            ));
-                                            current_text.clear();
-                                        }
-
-                                        current_style = style;
-                                        current_text.push_str(&cell.contents());
-                                    }
-                                }
-
-                                if !current_text.is_empty() {
-                                    spans.push(ratatui::text::Span::styled(
-                                        current_text,
-                                        current_style,
-                                    ));
-                                }
-
-                                Line::from(spans)
-                            })
-                            .collect();
-
                         // Build title with state indicator
                         let state_indicator = match &process.state {
                             ProcessState::Restarting => " [Restarting...]",
@@ -590,45 +505,17 @@ impl Widget for &mut App {
                         let title =
                             format!("{}{}", flock_process_config.display_name, state_indicator);
 
-                        Widget::render(
-                            Paragraph::new(lines).block(Block::bordered().title(title)),
-                            overall_layout[process_idx],
-                            buf,
-                        );
+                        widgets.push(AutoFillPty::new(
+                            process.pty_master.clone(),
+                            process.parser.clone(),
+                            title,
+                        ));
                     }
-                    None => Widget::render(
-                        Paragraph::new("").block(
-                            Block::bordered().title(flock_process_config.display_name.clone()),
-                        ),
-                        overall_layout[process_idx],
-                        buf,
-                    ),
+                    None => {}
                 }
             }
-        }
-    }
-}
 
-// Convert ANSI color index to Ratatui color
-fn ansi_to_ratatui_color(idx: u8) -> ratatui::style::Color {
-    use ratatui::style::Color;
-    match idx {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::Gray,
-        8 => Color::DarkGray,
-        9 => Color::LightRed,
-        10 => Color::LightGreen,
-        11 => Color::LightYellow,
-        12 => Color::LightBlue,
-        13 => Color::LightMagenta,
-        14 => Color::LightCyan,
-        15 => Color::White,
-        _ => Color::Reset,
+            SplitListView::new(widgets).render(overall_layout[1], buf)
+        }
     }
 }
