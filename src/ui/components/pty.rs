@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use portable_pty::{MasterPty, PtySize};
 use ratatui::{
@@ -8,14 +8,14 @@ use ratatui::{
 };
 
 pub struct AutoFillPty {
-    pub pty: Arc<Box<dyn MasterPty + Send + 'static>>,
+    pub pty: Arc<Mutex<Box<dyn MasterPty + Send + 'static>>>,
     pub parser: Arc<RwLock<vt100::Parser>>,
     pub title: String,
 }
 
 impl AutoFillPty {
     pub fn new(
-        pty: Arc<Box<dyn MasterPty + Send + 'static>>,
+        pty: Arc<Mutex<Box<dyn MasterPty + Send + 'static>>>,
         parser: Arc<RwLock<vt100::Parser>>,
         title: String,
     ) -> Self {
@@ -31,14 +31,15 @@ impl Widget for AutoFillPty {
         // Resize PTY and parser to match the layout (accounting for borders)
         let pty_cols = area.width.saturating_sub(2);
         let pty_rows = area.height.saturating_sub(2);
-        self.pty
-            .resize(PtySize {
+        if let Ok(pty) = self.pty.lock() {
+            pty.resize(PtySize {
                 rows: pty_rows,
                 cols: pty_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .unwrap();
+        }
 
         // Get the screen contents from the VT100 parser with colors
         self.parser.write().unwrap().set_size(pty_rows, pty_cols);

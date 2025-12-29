@@ -1,14 +1,9 @@
 mod components;
-use std::{
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
+
+use std::time::Duration;
 
 use anyhow::anyhow;
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use ratatui::widgets::ListState;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -19,7 +14,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::utils::file_watcher::{DebounceTimer, WatcherEvent};
+use crate::utils::file_watcher::WatcherEvent;
 use crate::utils::process::{ProcessState, ProcessStatus};
 use crate::{
     config::AppConfig,
@@ -46,8 +41,6 @@ struct App {
     config: AppConfig,
     flock_state: ListState,
     flock_processes: Vec<Vec<ProcessState>>,
-    shutdown_complete_rx: Receiver<(usize, usize)>,
-    shutdown_complete_tx: Sender<(usize, usize)>,
 }
 
 impl App {
@@ -66,15 +59,11 @@ impl App {
             })
             .collect();
 
-        let (shutdown_complete_tx, shutdown_complete_rx) = unbounded();
-
         Ok(Self {
             exit: false,
             config,
             flock_state,
             flock_processes,
-            shutdown_complete_rx,
-            shutdown_complete_tx,
         })
     }
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), FlokProgramError> {
@@ -92,108 +81,17 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn graceful_shutdown_async(
-        child: Arc<RwLock<Box<dyn portable_pty::Child + Send + Sync>>>,
-        timeout: Duration,
-        completion_sender: Sender<(usize, usize)>,
-        flock_idx: usize,
-        process_idx: usize,
-    ) {
-        std::thread::spawn(move || {
-            // Get the process ID
-            let pid = {
-                let child_lock = child.read().unwrap();
-                match child_lock.process_id() {
-                    Some(pid) => pid,
-                    None => {
-                        // No PID, notify completion and exit
-                        let _ = completion_sender.send((flock_idx, process_idx));
-                        return;
-                    }
-                }
-            };
-            let nix_pid = Pid::from_raw(pid as i32);
-
-            // Send SIGTERM
-            let _ = kill(nix_pid, Signal::SIGTERM);
-
-            // Wait for process to exit with timeout
-            let start = Instant::now();
-            loop {
-                let exit_status = {
-                    let mut child_lock = child.write().unwrap();
-                    child_lock.try_wait()
-                };
-
-                match exit_status {
-                    Ok(Some(_)) => {
-                        // Process exited, notify completion
-                        let _ = completion_sender.send((flock_idx, process_idx));
-                        return;
-                    }
-                    Ok(None) => {
-                        // Still running, check timeout
-                        if start.elapsed() >= timeout {
-                            // Timeout exceeded, send SIGKILL
-                            let _ = kill(nix_pid, Signal::SIGKILL);
-                            // Wait a bit for SIGKILL to take effect
-                            std::thread::sleep(Duration::from_millis(100));
-                            let _ = child.write().unwrap().try_wait();
-                            // Notify completion after SIGKILL
-                            let _ = completion_sender.send((flock_idx, process_idx));
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => {
-                        // Error checking, assume exited, notify completion
-                        let _ = completion_sender.send((flock_idx, process_idx));
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    fn restart_process(
-        &mut self,
-        flock_idx: usize,
-        process_idx: usize,
-    ) -> Result<(), FlokProgramExecutionError> {
-        // Set state to Restarting and clone the child Arc for background shutdown
-        if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
-            if let Some(state) = processes.get_mut(process_idx) {
-                if let ProcessStatus::Running(process) = &mut state.status {
-                    if let ProcessRunningStatus::Debouncing(_) = process.status {
-                        process.status = ProcessRunningStatus::Restarting;
-
-                        // Spawn graceful shutdown in background thread (non-blocking)
-                        // When complete, it will send a message to shutdown_complete_rx
-                        Self::graceful_shutdown_async(
-                            process.child.clone(),
-                            Duration::from_secs(5),
-                            self.shutdown_complete_tx.clone(),
-                            flock_idx,
-                            process_idx,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Don't launch new process here - wait for shutdown completion
-        Ok(())
-    }
-
     fn process_debounce_timers(&mut self) -> Result<(), FlokProgramExecutionError> {
         let mut to_restart = Vec::new();
 
         for (flock_idx, processes) in self.flock_processes.iter().enumerate() {
             for (process_idx, process_state) in processes.iter().enumerate() {
-                if let ProcessStatus::Running(process) = &process_state.status {
-                    if let ProcessRunningStatus::Debouncing(timer) = &process.status {
-                        if timer.is_expired() {
-                            to_restart.push((flock_idx, process_idx));
+                if let Ok(status) = process_state.status.read() {
+                    if let ProcessStatus::Running(process) = &*status {
+                        if let ProcessRunningStatus::Debouncing(timer) = &process.status {
+                            if timer.is_expired() {
+                                to_restart.push((flock_idx, process_idx));
+                            }
                         }
                     }
                 }
@@ -201,7 +99,12 @@ impl App {
         }
 
         for (flock_idx, process_idx) in to_restart {
-            self.restart_process(flock_idx, process_idx)?;
+            // Set state to Restarting and clone the child Arc for background shutdown
+            if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
+                if let Some(state) = processes.get_mut(process_idx) {
+                    state.restart();
+                }
+            }
         }
 
         Ok(())
@@ -222,22 +125,7 @@ impl App {
 
                 if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
                     if let Some(state) = processes.get_mut(process_idx) {
-                        let debounce_duration = process_config.watch.debounce_duration();
-
-                        match &mut state.status {
-                            ProcessStatus::Stopped => {}
-                            ProcessStatus::Running(process) => match &mut process.status {
-                                ProcessRunningStatus::Stable => {
-                                    process.status = ProcessRunningStatus::Debouncing(
-                                        DebounceTimer::new(debounce_duration),
-                                    );
-                                }
-                                ProcessRunningStatus::Debouncing(timer) => {
-                                    timer.reset();
-                                }
-                                ProcessRunningStatus::Restarting => {}
-                            },
-                        }
+                        state.initialize_restart_debouncing()?;
                     }
                 }
             }
@@ -260,16 +148,6 @@ impl App {
 
         // Process expired debounce timers
         self.process_debounce_timers()?;
-
-        // Check for shutdown completion events
-        if let Ok((flock_idx, process_idx)) = self.shutdown_complete_rx.try_recv() {
-            // Remove the old process (which is now terminated)
-            if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
-                if let Some(process) = processes.get_mut(process_idx) {
-                    process.launch().unwrap();
-                }
-            }
-        }
 
         if poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -328,23 +206,27 @@ impl Widget for &mut App {
                 .unwrap()
                 .iter()
                 .for_each(|state| {
-                    match state.status {
-                        ProcessStatus::Running(ref process) => {
-                            // Build title with state indicator
-                            let state_indicator = match &process.status {
-                                ProcessRunningStatus::Restarting => " [Restarting...]",
-                                _ => "",
-                            };
-                            let title =
-                                format!("{}{}", state.process_config.display_name, state_indicator);
+                    if let Ok(status) = state.status.read() {
+                        match *status {
+                            ProcessStatus::Running(ref process) => {
+                                // Build title with state indicator
+                                let state_indicator = match &process.status {
+                                    ProcessRunningStatus::Restarting => " [Restarting...]",
+                                    _ => "",
+                                };
+                                let title = format!(
+                                    "{}{}",
+                                    state.process_config.display_name, state_indicator
+                                );
 
-                            widgets.push(AutoFillPty::new(
-                                process.pty_master.clone(),
-                                process.parser.clone(),
-                                title,
-                            ));
+                                widgets.push(AutoFillPty::new(
+                                    process.pty_master.clone(),
+                                    process.parser.clone(),
+                                    title,
+                                ));
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 });
 
