@@ -12,6 +12,8 @@ pub enum FlokError {
 #[derive(Debug, Error)]
 pub enum FlokConfigError {
     #[error("{0}")]
+    ValidationError(#[from] serde_valid::validation::Errors),
+    #[error("{0}")]
     Known(#[from] anyhow::Error),
     #[error("An unknown IO error has occured: {0}")]
     UnknownStdIo(#[from] std::io::Error),
