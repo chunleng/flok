@@ -2,7 +2,6 @@ mod components;
 
 use std::time::Duration;
 
-use anyhow::anyhow;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 use ratatui::{
@@ -14,15 +13,11 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::utils::file_watcher::WatcherEvent;
+use crate::ui::components::lists::{SideListView, SplitListView};
 use crate::utils::process::{ProcessState, ProcessStatus};
 use crate::{
     config::AppConfig,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
-};
-use crate::{
-    ui::components::lists::{SideListView, SplitListView},
-    utils::file_watcher::{FILE_WATCHER, FileWatcherStatus},
 };
 use crate::{ui::components::pty::AutoFillPty, utils::process::ProcessRunningStatus};
 
@@ -81,42 +76,7 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn handle_file_change(&mut self) -> Result<(), FlokProgramExecutionError> {
-        if let Some(flock_idx) = self.flock_state.selected() {
-            let flock = self
-                .config
-                .flocks
-                .get(flock_idx)
-                .ok_or(anyhow!("Selected flock does not exist"))?;
-
-            for (process_idx, process_config) in flock.processes.iter().enumerate() {
-                if !process_config.watch.is_enabled() {
-                    continue;
-                }
-
-                if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
-                    if let Some(state) = processes.get_mut(process_idx) {
-                        state.initialize_restart_debouncing()?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn handle_event(&mut self) -> Result<(), FlokProgramExecutionError> {
-        // Check for file watcher events only if watcher is initialized
-        if let Ok(watcher) = FILE_WATCHER.read() {
-            match *watcher {
-                FileWatcherStatus::Enabled(ref watcher) => {
-                    if let Ok(WatcherEvent::FileChanged) = watcher.watcher_rx.try_recv() {
-                        self.handle_file_change()?;
-                    }
-                }
-                _ => {}
-            }
-        }
-
         if poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => match (k.modifiers, k.code) {

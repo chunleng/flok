@@ -11,7 +11,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::NamedTempFile;
 
 use crate::config::FlockProcessConfig;
-use crate::utils::file_watcher::ensure_watcher_initialized;
+use crate::utils::file_watcher::{
+    FILE_WATCHER, FileWatcherStatus, WatcherEvent, ensure_watcher_initialized,
+};
 
 pub struct ProcessState {
     pub process_config: Arc<FlockProcessConfig>,
@@ -42,34 +44,62 @@ impl ProcessState {
         if can_launch {
             if let Ok(mut status) = self.status.write() {
                 if is_launchable(&*status) {
-                    *status = ProcessStatus::Running(Process::new(&self.process_config)?);
+                    // Initialize watcher lazily if this is a watchable process
+                    if self.process_config.watch.is_enabled() {
+                        self.enable_file_watching()
+                    }
+
+                    *status = ProcessStatus::Running(Process::new(
+                        self.process_config.command.to_owned(),
+                    )?);
                 }
             }
         }
 
         Ok(())
     }
+    fn enable_file_watching(&self) {
+        ensure_watcher_initialized();
+        let status = self.status.clone();
+        let process_config = self.process_config.clone();
 
-    pub fn initialize_restart_debouncing(&mut self) -> Result<()> {
-        if let Ok(mut status) = self.status.write() {
-            match &mut *status {
-                ProcessStatus::Stopped => {}
-                ProcessStatus::Running(process) => match &mut process.status {
-                    ProcessRunningStatus::Stable => {
-                        process.status =
-                            ProcessRunningStatus::Debouncing(RestartDebounceHandler::new(
-                                self.process_config.clone(),
-                                self.status.clone(),
-                            ));
-                    }
-                    ProcessRunningStatus::Debouncing(timer) => {
-                        timer.reset();
-                    }
-                    ProcessRunningStatus::Restarting => {}
-                },
+        // Subscribe to the file watcher bus
+        let rx = if let Ok(watcher) = FILE_WATCHER.read() {
+            match &*watcher {
+                FileWatcherStatus::Enabled(watcher) => Some(watcher.subscribe()),
+                _ => None,
             }
+        } else {
+            None
+        };
+
+        if let Some(mut receiver) = rx {
+            thread::spawn(move || {
+                loop {
+                    if let Ok(WatcherEvent::FileChanged) = receiver.recv() {
+                        if let Ok(mut s) = status.write() {
+                            match &mut *s {
+                                ProcessStatus::Stopped => break,
+                                ProcessStatus::Running(process) => match &mut process.status {
+                                    ProcessRunningStatus::Stable => {
+                                        process.status = ProcessRunningStatus::Debouncing(
+                                            RestartDebounceHandler::new(
+                                                process_config.clone(),
+                                                status.clone(),
+                                            ),
+                                        );
+                                    }
+                                    ProcessRunningStatus::Debouncing(timer) => {
+                                        timer.reset();
+                                    }
+                                    ProcessRunningStatus::Restarting => {}
+                                },
+                            }
+                        }
+                    }
+                }
+            });
         }
-        Ok(())
     }
 }
 
@@ -94,12 +124,7 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(process_config: &FlockProcessConfig) -> Result<Self> {
-        // Initialize watcher lazily if this is a watchable process
-        if process_config.watch.is_enabled() {
-            ensure_watcher_initialized();
-        }
-
+    pub fn new(command: String) -> Result<Self> {
         // Launch the process using PTY for proper interactive support
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -113,7 +138,7 @@ impl Process {
 
         let mut script = NamedTempFile::new()?;
         let script_path = script.path().display().to_string();
-        writeln!(script, "{}", process_config.command)?;
+        writeln!(script, "{}", command)?;
         let _ = script.persist(script_path.clone());
 
         // Use the login shell from SHELL environment variable, fallback to sh
@@ -230,7 +255,8 @@ impl RestartDebounceHandler {
                                 let restart = move |status: Arc<RwLock<ProcessStatus>>| {
                                     if let Ok(mut s) = status.write() {
                                         *s = ProcessStatus::Running(
-                                            Process::new(&process_config).unwrap(),
+                                            Process::new(process_config.command.to_owned())
+                                                .unwrap(),
                                         );
                                     }
                                 };

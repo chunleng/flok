@@ -1,10 +1,10 @@
 use std::mem::discriminant;
 use std::path::Path;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::anyhow;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use bus::{Bus, BusReader};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 pub static FILE_WATCHER: LazyLock<RwLock<FileWatcherStatus>> =
@@ -22,9 +22,8 @@ pub fn ensure_watcher_initialized() {
     if !is_init {
         if let Ok(mut status) = FILE_WATCHER.write() {
             if *status == FileWatcherStatus::Disabled {
-                let (watcher_tx, watcher_rx) = unbounded();
                 let cwd = std::env::current_dir().unwrap();
-                let file_watcher = FileWatcher::new(&cwd, watcher_tx, watcher_rx)
+                let file_watcher = FileWatcher::new(&cwd)
                     .map_err(|e| anyhow!("Failed to initialize file watcher: {}", e))
                     .unwrap();
                 *status = FileWatcherStatus::Enabled(file_watcher);
@@ -33,6 +32,7 @@ pub fn ensure_watcher_initialized() {
     }
 }
 
+#[derive(Clone, Debug)]
 pub enum WatcherEvent {
     FileChanged,
 }
@@ -49,23 +49,24 @@ impl PartialEq for FileWatcherStatus {
 }
 
 pub struct FileWatcher {
-    pub watcher_rx: Receiver<WatcherEvent>,
+    pub bus: Arc<Mutex<Bus<WatcherEvent>>>,
     _watcher: RecommendedWatcher,
 }
 
 impl FileWatcher {
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-        sender: Sender<WatcherEvent>,
-        receiver: Receiver<WatcherEvent>,
-    ) -> Result<Self, notify::Error> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, notify::Error> {
+        let bus = Arc::new(Mutex::new(Bus::new(100)));
+        let bus_clone = bus.clone();
+
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     // Only react to modify, create, and remove events
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
-                            let _ = sender.send(WatcherEvent::FileChanged);
+                            if let Ok(mut b) = bus_clone.lock() {
+                                b.broadcast(WatcherEvent::FileChanged);
+                            }
                         }
                         _ => {}
                     }
@@ -77,8 +78,12 @@ impl FileWatcher {
         watcher.watch(path.as_ref(), RecursiveMode::Recursive)?;
 
         Ok(Self {
-            watcher_rx: receiver,
+            bus,
             _watcher: watcher,
         })
+    }
+
+    pub fn subscribe(&self) -> BusReader<WatcherEvent> {
+        self.bus.lock().unwrap().add_rx()
     }
 }
