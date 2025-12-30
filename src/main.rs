@@ -3,11 +3,13 @@ use std::{fs::File, path::PathBuf};
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use error::{FlokConfigError, FlokError};
+use serde_valid::Validate;
 
 use crate::config::AppConfig;
 
 mod config;
 mod error;
+mod state;
 mod ui;
 mod utils;
 
@@ -38,15 +40,18 @@ fn main() {
 fn process_config(cli: Cli) -> Result<AppConfig, FlokConfigError> {
     let config_file = cli.config_file.unwrap_or("./flok.yaml".into());
 
-    Ok(serde_yaml::from_reader(
-        File::open(config_file.clone()).map_err(move |_| {
+    let config: AppConfig =
+        serde_yaml::from_reader(File::open(config_file.clone()).map_err(move |_| {
             // TODO more fine grain error handling
             anyhow!(format!(
                 "Unable to open \"{}\", please check if it exists and is readable",
                 config_file.to_string_lossy().to_string()
             ))
-        })?,
-    )?)
+        })?)?;
+
+    config.validate()?;
+
+    Ok(config)
 }
 
 fn process_cmd() -> Result<(), FlokError> {

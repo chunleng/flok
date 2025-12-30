@@ -23,7 +23,7 @@ impl<'a> SideListView<'a> {
     }
 }
 impl<'a> StatefulWidget for SideListView<'a> {
-    type State = ListState;
+    type State = usize;
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         StatefulWidget::render(
             List::new(self.items)
@@ -36,7 +36,7 @@ impl<'a> StatefulWidget for SideListView<'a> {
                 .highlight_style(Style::default().reversed()),
             area,
             buf,
-            state,
+            &mut ListState::default().with_selected(Some(*state)),
         );
     }
 }
