@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_valid::Validate;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Validate)]
 pub struct AppConfig {
+    #[validate(min_items = 1)]
     pub flocks: Vec<FlockConfig>,
 }
 

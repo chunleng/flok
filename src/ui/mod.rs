@@ -3,7 +3,6 @@ mod components;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::widgets::ListState;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -13,8 +12,9 @@ use ratatui::{
     widgets::Widget,
 };
 
+use crate::state::AppState;
 use crate::ui::components::lists::{SideListView, SplitListView};
-use crate::utils::process::{ProcessState, ProcessStatus};
+use crate::utils::process::ProcessStatus;
 use crate::{
     config::AppConfig,
     error::{FlokProgramError, FlokProgramExecutionError, FlokProgramInitError},
@@ -33,32 +33,14 @@ pub fn run(config: AppConfig) -> Result<(), FlokProgramError> {
 
 struct App {
     exit: bool,
-    config: AppConfig,
-    flock_state: ListState,
-    flock_processes: Vec<Vec<ProcessState>>,
+    state: AppState,
 }
 
 impl App {
     fn new(config: AppConfig) -> Result<Self, anyhow::Error> {
-        let mut flock_state = ListState::default();
-        flock_state.select(Some(0));
-        let flock_processes: Vec<Vec<_>> = config
-            .flocks
-            .iter()
-            .map(|flock_cfg| {
-                flock_cfg
-                    .processes
-                    .iter()
-                    .map(|process_cfg| ProcessState::new(process_cfg.clone()))
-                    .collect()
-            })
-            .collect();
-
         Ok(Self {
             exit: false,
-            config,
-            flock_state,
-            flock_processes,
+            state: AppState::new(config.clone()),
         })
     }
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), FlokProgramError> {
@@ -85,21 +67,13 @@ impl App {
                         self.exit = true;
                     }
                     (KeyModifiers::NONE, KeyCode::Char('j') | KeyCode::Down) => {
-                        self.flock_state.select_next();
+                        self.state.next_item();
                     }
                     (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => {
-                        self.flock_state.select_previous();
+                        self.state.previous_item();
                     }
                     (KeyModifiers::NONE, KeyCode::Enter) => {
-                        if let Some(flock_idx) = self.flock_state.selected() {
-                            self.flock_processes
-                                .get_mut(flock_idx)
-                                .expect("Flock should exists, but didn't")
-                                .iter_mut()
-                                .for_each(|x| {
-                                    x.launch().unwrap();
-                                });
-                        }
+                        self.state.select();
                     }
                     _ => {}
                 },
@@ -116,49 +90,53 @@ impl Widget for &mut App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(20), Constraint::Fill(1)])
             .areas(area);
-        SideListView::new(
-            "Flocks".to_string(),
-            self.config
-                .flocks
-                .iter()
-                .map(|f| f.display_name.to_owned())
-                .collect(),
-        )
-        .render(sidebar_area, buf, &mut self.flock_state);
+        match &mut self.state {
+            AppState::Main(state, global_state) => {
+                SideListView::new(
+                    "Flocks".to_string(),
+                    global_state
+                        .flocks
+                        .iter()
+                        .map(|f| f.display_name.to_owned())
+                        .collect(),
+                )
+                .render(sidebar_area, buf, &mut state.active_flock);
 
-        // Display processes for the selected flock
-        if let Some(selected_flock_idx) = self.flock_state.selected() {
-            let mut widgets = Vec::new();
-            self.flock_processes
-                .get(selected_flock_idx)
-                .unwrap()
-                .iter()
-                .for_each(|state| {
-                    if let Ok(status) = state.status.read() {
-                        match *status {
-                            ProcessStatus::Running(ref process) => {
-                                // Build title with state indicator
-                                let state_indicator = match &process.status {
-                                    ProcessRunningStatus::Restarting => " [Restarting...]",
-                                    _ => "",
-                                };
-                                let title = format!(
-                                    "{}{}",
-                                    state.process_config.display_name, state_indicator
-                                );
+                let mut widgets = Vec::new();
+                global_state
+                    .flocks
+                    .get(state.active_flock)
+                    .unwrap()
+                    .processes
+                    .iter()
+                    .for_each(|state| {
+                        if let Ok(status) = state.status.read() {
+                            match *status {
+                                ProcessStatus::Running(ref process) => {
+                                    // Build title with state indicator
+                                    let state_indicator = match &process.status {
+                                        ProcessRunningStatus::Restarting => " [Restarting...]",
+                                        _ => "",
+                                    };
+                                    let title = format!(
+                                        "{}{}",
+                                        state.process_config.display_name, state_indicator
+                                    );
 
-                                widgets.push(AutoFillPty::new(
-                                    process.pty_master.clone(),
-                                    process.parser.clone(),
-                                    title,
-                                ));
+                                    widgets.push(AutoFillPty::new(
+                                        process.pty_master.clone(),
+                                        process.parser.clone(),
+                                        title,
+                                    ));
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                });
+                    });
 
-            SplitListView::new(widgets).render(main_area, buf)
+                SplitListView::new(widgets).render(main_area, buf)
+            }
         }
     }
 }
+
