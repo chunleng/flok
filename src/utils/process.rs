@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::mem::discriminant;
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -9,8 +10,8 @@ use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::NamedTempFile;
 
+use crate::config::FlockProcessConfig;
 use crate::utils::file_watcher::ensure_watcher_initialized;
-use crate::{config::FlockProcessConfig, utils::file_watcher::DebounceTimer};
 
 pub struct ProcessState {
     pub process_config: Arc<FlockProcessConfig>,
@@ -55,9 +56,11 @@ impl ProcessState {
                 ProcessStatus::Stopped => {}
                 ProcessStatus::Running(process) => match &mut process.status {
                     ProcessRunningStatus::Stable => {
-                        process.status = ProcessRunningStatus::Debouncing(DebounceTimer::new(
-                            self.process_config.watch.debounce_duration(),
-                        ));
+                        process.status =
+                            ProcessRunningStatus::Debouncing(RestartDebounceHandler::new(
+                                self.process_config.clone(),
+                                self.status.clone(),
+                            ));
                     }
                     ProcessRunningStatus::Debouncing(timer) => {
                         timer.reset();
@@ -67,97 +70,6 @@ impl ProcessState {
             }
         }
         Ok(())
-    }
-
-    pub fn restart(&self) {
-        fn is_restartable(status: &ProcessStatus) -> bool {
-            if let ProcessStatus::Running(process) = status {
-                if let ProcessRunningStatus::Debouncing(_) = process.status {
-                    return true;
-                }
-            }
-            false
-        }
-        let restartable = if let Ok(status) = self.status.read() {
-            is_restartable(&*status)
-        } else {
-            false
-        };
-
-        if restartable {
-            if let Ok(mut status) = self.status.write() {
-                if is_restartable(&*status) {
-                    if let ProcessStatus::Running(process) = &mut *status {
-                        process.status = ProcessRunningStatus::Restarting;
-
-                        let process_config = self.process_config.clone();
-                        let child = process.child.clone();
-                        let status = self.status.clone();
-                        std::thread::spawn(move || {
-                            let restart = move |status: Arc<RwLock<ProcessStatus>>| {
-                                if let Ok(mut s) = status.write() {
-                                    *s = ProcessStatus::Running(
-                                        Process::new(&process_config).unwrap(),
-                                    );
-                                }
-                            };
-                            // Get the process ID
-                            let pid = {
-                                let child_lock = child.read().unwrap();
-                                match child_lock.process_id() {
-                                    Some(pid) => pid,
-                                    None => {
-                                        // No PID, notify completion and exit
-                                        restart(status);
-                                        return;
-                                    }
-                                }
-                            };
-                            let nix_pid = Pid::from_raw(pid as i32);
-
-                            // Send SIGTERM
-                            let _ = kill(nix_pid, Signal::SIGTERM);
-
-                            // Wait for process to exit with timeout
-                            let start = Instant::now();
-                            loop {
-                                let exit_status = {
-                                    let mut child_lock = child.write().unwrap();
-                                    child_lock.try_wait()
-                                };
-
-                                match exit_status {
-                                    Ok(Some(_)) => {
-                                        // Process exited, notify completion
-                                        let _ = restart(status);
-                                        return;
-                                    }
-                                    Ok(None) => {
-                                        // Still running, check timeout
-                                        if start.elapsed() >= Duration::from_secs(5) {
-                                            // Timeout exceeded, send SIGKILL
-                                            let _ = kill(nix_pid, Signal::SIGKILL);
-                                            // Wait a bit for SIGKILL to take effect
-                                            std::thread::sleep(Duration::from_millis(100));
-                                            let _ = child.write().unwrap().try_wait();
-                                            // Notify completion after SIGKILL
-                                            let _ = restart(status);
-                                            return;
-                                        }
-                                        std::thread::sleep(Duration::from_millis(50));
-                                    }
-                                    Err(_) => {
-                                        // Error checking, assume exited, notify completion
-                                        let _ = restart(status);
-                                        return;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -251,12 +163,146 @@ impl Process {
 #[derive(Clone)]
 pub enum ProcessRunningStatus {
     Stable,
-    Debouncing(DebounceTimer),
+    Debouncing(RestartDebounceHandler),
     Restarting,
 }
 
 impl PartialEq for ProcessRunningStatus {
     fn eq(&self, other: &Self) -> bool {
         discriminant(self) == discriminant(other)
+    }
+}
+
+#[derive(Clone)]
+pub struct RestartDebounceHandler {
+    started_at: Arc<RwLock<Instant>>,
+}
+
+impl RestartDebounceHandler {
+    pub fn new(
+        process_config: Arc<FlockProcessConfig>,
+        status: Arc<RwLock<ProcessStatus>>,
+    ) -> Self {
+        let started_at = Arc::new(RwLock::new(Instant::now()));
+        let s = Self { started_at };
+        s.spawn_handler_thread(process_config, status);
+        s
+    }
+
+    pub fn reset(&mut self) {
+        if let Ok(mut started_at) = self.started_at.write() {
+            *started_at = Instant::now();
+        }
+    }
+
+    fn spawn_handler_thread(
+        &self,
+        process_config: Arc<FlockProcessConfig>,
+        status: Arc<RwLock<ProcessStatus>>,
+    ) {
+        let duration = process_config.watch.debounce_duration();
+        fn is_restartable(status: &ProcessStatus) -> bool {
+            if let ProcessStatus::Running(process) = status {
+                if let ProcessRunningStatus::Debouncing(_) = process.status {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let handler = move || {
+            let restartable = if let Ok(s) = status.read() {
+                is_restartable(&*s)
+            } else {
+                false
+            };
+
+            if restartable {
+                if let Ok(mut s) = status.write() {
+                    if is_restartable(&*s) {
+                        if let ProcessStatus::Running(process) = &mut *s {
+                            process.status = ProcessRunningStatus::Restarting;
+
+                            let process_config = process_config.clone();
+                            let child = process.child.clone();
+                            let status = status.clone();
+                            std::thread::spawn(move || {
+                                let restart = move |status: Arc<RwLock<ProcessStatus>>| {
+                                    if let Ok(mut s) = status.write() {
+                                        *s = ProcessStatus::Running(
+                                            Process::new(&process_config).unwrap(),
+                                        );
+                                    }
+                                };
+                                // Get the process ID
+                                let pid = {
+                                    let child_lock = child.read().unwrap();
+                                    match child_lock.process_id() {
+                                        Some(pid) => pid,
+                                        None => {
+                                            // No PID, notify completion and exit
+                                            restart(status);
+                                            return;
+                                        }
+                                    }
+                                };
+                                let nix_pid = Pid::from_raw(pid as i32);
+
+                                // Send SIGTERM
+                                let _ = kill(nix_pid, Signal::SIGTERM);
+
+                                // Wait for process to exit with timeout
+                                let start = Instant::now();
+                                loop {
+                                    let exit_status = {
+                                        let mut child_lock = child.write().unwrap();
+                                        child_lock.try_wait()
+                                    };
+
+                                    match exit_status {
+                                        Ok(Some(_)) => {
+                                            // Process exited, notify completion
+                                            let _ = restart(status);
+                                            return;
+                                        }
+                                        Ok(None) => {
+                                            // Still running, check timeout
+                                            if start.elapsed() >= Duration::from_secs(5) {
+                                                // Timeout exceeded, send SIGKILL
+                                                let _ = kill(nix_pid, Signal::SIGKILL);
+                                                // Wait a bit for SIGKILL to take effect
+                                                std::thread::sleep(Duration::from_millis(100));
+                                                let _ = child.write().unwrap().try_wait();
+                                                // Notify completion after SIGKILL
+                                                let _ = restart(status);
+                                                return;
+                                            }
+                                            std::thread::sleep(Duration::from_millis(50));
+                                        }
+                                        Err(_) => {
+                                            // Error checking, assume exited, notify completion
+                                            let _ = restart(status);
+                                            return;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        };
+
+        let started_at = self.started_at.clone();
+        thread::spawn(move || {
+            loop {
+                if let Ok(started_at) = started_at.read() {
+                    if started_at.elapsed() >= duration {
+                        handler();
+                        break;
+                    }
+                }
+            }
+        });
     }
 }

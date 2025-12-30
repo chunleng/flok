@@ -81,35 +81,6 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn process_debounce_timers(&mut self) -> Result<(), FlokProgramExecutionError> {
-        let mut to_restart = Vec::new();
-
-        for (flock_idx, processes) in self.flock_processes.iter().enumerate() {
-            for (process_idx, process_state) in processes.iter().enumerate() {
-                if let Ok(status) = process_state.status.read() {
-                    if let ProcessStatus::Running(process) = &*status {
-                        if let ProcessRunningStatus::Debouncing(timer) = &process.status {
-                            if timer.is_expired() {
-                                to_restart.push((flock_idx, process_idx));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (flock_idx, process_idx) in to_restart {
-            // Set state to Restarting and clone the child Arc for background shutdown
-            if let Some(processes) = self.flock_processes.get_mut(flock_idx) {
-                if let Some(state) = processes.get_mut(process_idx) {
-                    state.restart();
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn handle_file_change(&mut self) -> Result<(), FlokProgramExecutionError> {
         if let Some(flock_idx) = self.flock_state.selected() {
             let flock = self
@@ -145,9 +116,6 @@ impl App {
                 _ => {}
             }
         }
-
-        // Process expired debounce timers
-        self.process_debounce_timers()?;
 
         if poll(Duration::from_millis(100))? {
             match event::read()? {

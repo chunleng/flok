@@ -1,7 +1,7 @@
 use std::mem::discriminant;
+use std::path::Path;
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
-use std::{path::Path, time::Instant};
 
 use anyhow::anyhow;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -30,29 +30,6 @@ pub fn ensure_watcher_initialized() {
                 *status = FileWatcherStatus::Enabled(file_watcher);
             }
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DebounceTimer {
-    pub started_at: Instant,
-    pub duration: Duration,
-}
-
-impl DebounceTimer {
-    pub fn new(duration: Duration) -> Self {
-        Self {
-            started_at: Instant::now(),
-            duration,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.started_at = Instant::now();
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.started_at.elapsed() >= self.duration
     }
 }
 
