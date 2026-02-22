@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::state::AppState;
-use crate::ui::components::lists::{SideListView, SplitListView};
+use crate::ui::components::lists::{ProcessWidget, SideListView, SplitListView};
 use crate::utils::process::ProcessStatus;
 use crate::{
     config::AppConfig,
@@ -102,18 +102,16 @@ impl Widget for &mut App {
                 )
                 .render(sidebar_area, buf, &mut state.active_flock);
 
-                let mut widgets = Vec::new();
-                global_state
+                let widgets: Vec<ProcessWidget> = global_state
                     .flocks
                     .get(state.active_flock)
                     .unwrap()
                     .processes
                     .iter()
-                    .for_each(|state| {
+                    .map(|state| {
                         if let Ok(status) = state.status.read() {
                             match *status {
                                 ProcessStatus::Running(ref process) => {
-                                    // Build title with state indicator
                                     let state_indicator = match &process.status {
                                         ProcessRunningStatus::Restarting => " [Restarting...]",
                                         _ => "",
@@ -123,20 +121,22 @@ impl Widget for &mut App {
                                         state.process_config.display_name, state_indicator
                                     );
 
-                                    widgets.push(AutoFillPty::new(
+                                    ProcessWidget::Pty(AutoFillPty::new(
                                         process.pty_master.clone(),
                                         process.parser.clone(),
                                         title,
-                                    ));
+                                    ))
                                 }
-                                _ => {}
+                                _ => ProcessWidget::Empty,
                             }
+                        } else {
+                            ProcessWidget::Empty
                         }
-                    });
+                    })
+                    .collect();
 
                 SplitListView::new(widgets).render(main_area, buf)
             }
         }
     }
 }
-
