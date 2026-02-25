@@ -106,7 +106,7 @@ impl Widget for &mut App {
                     .flocks
                     .get(state.active_flock)
                     .unwrap()
-                    .processes
+                    .process_states
                     .iter()
                     .map(|state| {
                         if let Ok(status) = state.status.read() {

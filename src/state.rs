@@ -6,7 +6,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    config::{AppConfig, FlockConfig, FlockProcessConfig},
+    config::{AppConfig, FlockConfig, ProcessConfig},
     utils::{
         file_watcher::{FILE_WATCHER, FileWatcherStatus, WatcherEvent, ensure_watcher_initialized},
         process::{Process, ProcessRunningStatus, ProcessStatus, RestartDebounceHandler},
@@ -28,16 +28,21 @@ pub struct GlobalUIState {
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
-        let flock_processes = config
+        let process_states = config
+            .processes
+            .into_iter()
+            .map(|x| Arc::new(ProcessState::new(x)))
+            .collect();
+        let flock_states = config
             .flocks
             .into_iter()
-            .map(|flock_cfg| FlockState::from(flock_cfg))
+            .map(|flock_cfg| FlockState::from_config(flock_cfg, &process_states))
             .collect();
 
         Self::Main(
             MainUIState { active_flock: 0 },
             GlobalUIState {
-                flocks: flock_processes,
+                flocks: flock_states,
             },
         )
     }
@@ -60,7 +65,7 @@ impl AppState {
     pub fn select(&mut self) {
         match self {
             AppState::Main(state, global_state) => {
-                state.launch_flock(&mut global_state.flocks);
+                state.launch_flock(&global_state.flocks);
             }
         }
     }
@@ -85,12 +90,12 @@ impl MainUIState {
             self.active_flock -= 1;
         };
     }
-    fn launch_flock(&mut self, flocks: &mut Vec<FlockState>) {
+    fn launch_flock(&mut self, flocks: &[FlockState]) {
         flocks
-            .get_mut(self.active_flock)
+            .get(self.active_flock)
             .expect("Flock should exists, but didn't")
-            .processes
-            .iter_mut()
+            .process_states
+            .iter()
             .for_each(|x| {
                 x.launch().unwrap();
             });
@@ -99,36 +104,37 @@ impl MainUIState {
 
 pub struct FlockState {
     pub display_name: String,
-    pub processes: Vec<ProcessState>,
+    pub process_states: Vec<Arc<ProcessState>>,
 }
 
-impl From<FlockConfig> for FlockState {
-    fn from(config: FlockConfig) -> Self {
+impl FlockState {
+    fn from_config(config: FlockConfig, process_states: &Vec<Arc<ProcessState>>) -> Self {
         Self {
             display_name: config.display_name,
-            processes: config
+            process_states: config
                 .processes
-                .into_iter()
-                .map(|process_cfg| ProcessState::new(process_cfg))
+                .iter()
+                .filter_map(|x| process_states.iter().find(|y| &y.process_config.id == x))
+                .cloned()
                 .collect(),
         }
     }
 }
 
 pub struct ProcessState {
-    pub process_config: Arc<FlockProcessConfig>,
+    pub process_config: Arc<ProcessConfig>,
     pub status: Arc<RwLock<ProcessStatus>>,
 }
 
 impl ProcessState {
-    pub fn new(process_config: FlockProcessConfig) -> Self {
+    pub fn new(process_config: ProcessConfig) -> Self {
         Self {
             process_config: Arc::new(process_config),
             status: Arc::new(RwLock::new(ProcessStatus::Stopped)),
         }
     }
 
-    pub fn launch(&mut self) -> Result<()> {
+    pub fn launch(&self) -> Result<()> {
         fn is_launchable(status: &ProcessStatus) -> bool {
             status == &ProcessStatus::Stopped
         }

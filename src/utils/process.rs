@@ -10,7 +10,7 @@ use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::NamedTempFile;
 
-use crate::config::FlockProcessConfig;
+use crate::config::ProcessConfig;
 
 #[derive(Clone)]
 pub enum ProcessStatus {
@@ -113,10 +113,7 @@ pub struct RestartDebounceHandler {
 }
 
 impl RestartDebounceHandler {
-    pub fn new(
-        process_config: Arc<FlockProcessConfig>,
-        status: Arc<RwLock<ProcessStatus>>,
-    ) -> Self {
+    pub fn new(process_config: Arc<ProcessConfig>, status: Arc<RwLock<ProcessStatus>>) -> Self {
         let started_at = Arc::new(RwLock::new(Instant::now()));
         let s = Self { started_at };
         s.spawn_handler_thread(process_config, status);
@@ -131,7 +128,7 @@ impl RestartDebounceHandler {
 
     fn spawn_handler_thread(
         &self,
-        process_config: Arc<FlockProcessConfig>,
+        process_config: Arc<ProcessConfig>,
         status: Arc<RwLock<ProcessStatus>>,
     ) {
         let duration = process_config.watch.debounce_duration();
