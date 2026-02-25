@@ -7,16 +7,19 @@ use serde_valid::Validate;
 pub struct AppConfig {
     #[validate(min_items = 1)]
     pub flocks: Vec<FlockConfig>,
+    #[serde(default)]
+    pub processes: Vec<ProcessConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlockConfig {
     pub display_name: String,
-    pub processes: Vec<FlockProcessConfig>,
+    pub processes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FlockProcessConfig {
+pub struct ProcessConfig {
+    pub id: String,
     pub display_name: String,
     pub command: String,
     #[serde(default)]
