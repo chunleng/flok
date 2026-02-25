@@ -1,24 +1,7 @@
 use ratatui::{
-    buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
-    widgets::{Block, Widget},
+    layout::{Constraint, Direction, Layout},
+    widgets::Widget,
 };
-
-use crate::ui::components::pty::AutoFillPty;
-
-pub enum ProcessWidget {
-    Pty(AutoFillPty),
-    Empty,
-}
-
-impl Widget for ProcessWidget {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        match self {
-            ProcessWidget::Pty(pty) => pty.render(area, buf),
-            ProcessWidget::Empty => Block::default().render(area, buf),
-        }
-    }
-}
 
 pub struct SplitListView<T> {
     widgets: Vec<T>,

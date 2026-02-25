@@ -2,4 +2,4 @@ mod sidelistview;
 mod splitlistview;
 
 pub use sidelistview::SideListView;
-pub use splitlistview::{ProcessWidget, SplitListView};
+pub use splitlistview::SplitListView;

@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::state::AppState;
-use crate::ui::components::lists::{ProcessWidget, SideListView, SplitListView};
+use crate::ui::components::lists::{SideListView, SplitListView};
 use crate::utils::process::ProcessStatus;
 use crate::{
     config::AppConfig,
@@ -102,13 +102,13 @@ impl Widget for &mut App {
                 )
                 .render(sidebar_area, buf, &mut state.active_flock);
 
-                let widgets: Vec<ProcessWidget> = global_state
+                let widgets = global_state
                     .flocks
                     .get(state.active_flock)
                     .unwrap()
                     .process_states
                     .iter()
-                    .map(|state| {
+                    .filter_map(|state| {
                         if let Ok(status) = state.status.read() {
                             match *status {
                                 ProcessStatus::Running(ref process) => {
@@ -121,16 +121,16 @@ impl Widget for &mut App {
                                         state.process_config.display_name, state_indicator
                                     );
 
-                                    ProcessWidget::Pty(AutoFillPty::new(
+                                    Some(AutoFillPty::new(
                                         process.pty_master.clone(),
                                         process.parser.clone(),
                                         title,
                                     ))
                                 }
-                                _ => ProcessWidget::Empty,
+                                _ => None,
                             }
                         } else {
-                            ProcessWidget::Empty
+                            None
                         }
                     })
                     .collect();
