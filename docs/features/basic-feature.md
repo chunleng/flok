@@ -26,7 +26,8 @@ The feature enables developers to:
 
 ### Configuration Management
 
-The configuration system reads and parses a YAML file that defines available flocks and their associated processes.
+The configuration system reads and parses a YAML file that defines available
+flocks and their associated processes.
 
 **Configuration File Location:**
 - Fixed path: `./flok.yaml` in the current working directory
@@ -37,15 +38,15 @@ The configuration system reads and parses a YAML file that defines available flo
 ```yaml
 flocks:
   - display_name: <string>      # Human-readable name shown in the TUI
-    processes:
-      - display_name: <string>  # Human-readable name for the process pane title
-        command: <string>       # Shell command to execute
-      - display_name: <string>
-        command: <string>
+    processes: ["id_1", "id_2"] # Link to process by id
   - display_name: <string>
-    processes:
-      - display_name: <string>
-        command: <string>
+    processes: []
+processes:
+  - id: id_1
+    display_name: <string> # Human-readable name for the process pane title
+    command: <string>      # Shell command to execute
+  - id: id_2
+    # ...
 ```
 
 **Example Configuration:**
@@ -82,7 +83,8 @@ A navigable list interface displayed on the left side of the terminal allowing u
 
 ### Split-Pane Process Output Display
 
-The main display area shows output from all processes in the currently selected flock, with each process having its own dedicated pane.
+The main display area shows output from all processes in the currently selected
+flock, with each process having its own dedicated pane.
 
 **Layout Behavior:**
 - Occupies approximately 80% of the terminal width (right side)
