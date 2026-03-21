@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::{
     config::{AppConfig, FlockConfig, ProcessConfig},
     utils::{
-        file_watcher::{FILE_WATCHER, FileWatcherStatus, WatcherEvent, ensure_watcher_initialized},
+        file_watcher::{FileWatcher, WatcherEvent},
         process::{Process, ProcessRunningStatus, ProcessStatus, RestartDebounceHandler},
     },
 };
@@ -165,46 +165,45 @@ impl ProcessState {
         Ok(())
     }
     fn enable_file_watching(&self) {
-        ensure_watcher_initialized();
+        let watch_path = match self.process_config.watch.resolve_watch_path() {
+            Some(path) => path,
+            None => return,
+        };
+
+        let watcher = match FileWatcher::new(&watch_path) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+
+        let mut receiver = watcher.subscribe();
         let status = self.status.clone();
         let process_config = self.process_config.clone();
 
-        // Subscribe to the file watcher bus
-        let rx = if let Ok(watcher) = FILE_WATCHER.read() {
-            match &*watcher {
-                FileWatcherStatus::Enabled(watcher) => Some(watcher.subscribe()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some(mut receiver) = rx {
-            thread::spawn(move || {
-                loop {
-                    if let Ok(WatcherEvent::FileChanged) = receiver.recv() {
-                        if let Ok(mut s) = status.write() {
-                            match &mut *s {
-                                ProcessStatus::Stopped => break,
-                                ProcessStatus::Running(process) => match &mut process.status {
-                                    ProcessRunningStatus::Stable => {
-                                        process.status = ProcessRunningStatus::Debouncing(
-                                            RestartDebounceHandler::new(
-                                                process_config.clone(),
-                                                status.clone(),
-                                            ),
-                                        );
-                                    }
-                                    ProcessRunningStatus::Debouncing(timer) => {
-                                        timer.reset();
-                                    }
-                                    ProcessRunningStatus::Restarting => {}
-                                },
-                            }
+        thread::spawn(move || {
+            let _watcher = watcher;
+            loop {
+                if let Ok(WatcherEvent::FileChanged) = receiver.recv() {
+                    if let Ok(mut s) = status.write() {
+                        match &mut *s {
+                            ProcessStatus::Stopped => break,
+                            ProcessStatus::Running(process) => match &mut process.status {
+                                ProcessRunningStatus::Stable => {
+                                    process.status = ProcessRunningStatus::Debouncing(
+                                        RestartDebounceHandler::new(
+                                            process_config.clone(),
+                                            status.clone(),
+                                        ),
+                                    );
+                                }
+                                ProcessRunningStatus::Debouncing(timer) => {
+                                    timer.reset();
+                                }
+                                ProcessRunningStatus::Restarting => {}
+                            },
                         }
                     }
                 }
-            });
-        }
+            }
+        });
     }
 }
