@@ -2,10 +2,12 @@
 
 ## Overview
 
-This feature enables automatic process restart when file changes are detected in the current working directory. When a user launches processes for a flock, the application will monitor the filesystem for changes and automatically restart the affected processes. The feature uses graceful shutdown by sending SIGTERM first, waiting for a timeout, then sending SIGKILL if the process has not terminated.
+This feature enables automatic process restart when file changes are detected in a configured watch directory. When a user launches processes for a flock, the application will monitor the configured filesystem path for changes and automatically restart the affected processes. The feature uses graceful shutdown by sending SIGTERM first, waiting for a timeout, then sending SIGKILL if the process has not terminated.
 
 Key capabilities:
-- Monitor the entire current working directory for file changes
+- Monitor a configured directory for file changes
+- Support watch path input as absolute or relative path
+- Resolve relative watch paths from the configuration file directory
 - Automatically restart processes when changes are detected
 - Graceful shutdown with SIGTERM followed by SIGKILL after timeout
 
@@ -21,9 +23,11 @@ Key capabilities:
 
 ### File System Watcher
 
-A background thread monitors the current working directory recursively for file changes. The watcher uses `notify` to detect filesystem events in real-time.
+A background thread monitors the configured watch directory recursively for file changes. The watcher uses `notify` to detect filesystem events in real-time.
 
 The watcher sends events through a channel to the main application event loop.
+
+If the configured path is relative, it is resolved against the current working directory. If the configured path is absolute, it is used directly.
 
 ### Process Restart on File Change
 
@@ -51,11 +55,16 @@ flocks:
     processes:
       - display_name: web server
         command: npm run dev
-        watch: true  # Uses default 2 second debounce
+        watch: true  # Uses default behavior and default watch path
       - display_name: api server
         command: npm run api
         watch:
-          debounce_seconds: 5  # Custom debounce time
+          debounce_seconds: 5
+          path: ./src  # Relative path (resolved from config file directory)
+      - display_name: worker
+        command: npm run worker
+        watch:
+          path: /workspace/monorepo/shared  # Absolute path
       - display_name: database
         command: docker-compose up db
         watch: false
@@ -67,8 +76,12 @@ Configuration field:
   - `false`: Disables file watching
   - `watch.debounce_seconds`: Enables file watching with custom debounce time
     (Default 1s)
+  - `watch.path`: Optional directory path to monitor for changes
+    - Absolute path: used directly
+    - Relative path: resolved from the current working directory
+    - If omitted: uses current working directory
 
-Only processes with `watch: true` or `watch: { debounce_seconds: N }` will be automatically restarted when file changes are detected. Processes without this field or with `watch: false` will not be affected by file system events, though they can still be manually restarted via the Enter key.
+Only processes with `watch: true` or `watch: { ... }` will be automatically restarted when file changes are detected. Processes without this field or with `watch: false` will not be affected by file system events, though they can still be manually restarted via the Enter key.
 
 ### Event Loop Integration
 
@@ -115,6 +128,7 @@ Possible solution: Use process groups and send signals to the entire group using
 
 ### File Watcher Resource Limits
 
-Operating systems limit the number of file watches. For large projects, watching the entire directory tree may exceed these limits.
+Operating systems limit the number of file watches. For large projects, broad recursive watching may exceed these limits.
 
-Possible solution: Document the limitation and provide guidance on increasing system limits. Consider future enhancement to support glob patterns for selective watching.
+Possible solution: Use `watch.path` to scope monitoring to the most relevant directory and reduce watch volume. Document system limit tuning guidance for large repositories.
+

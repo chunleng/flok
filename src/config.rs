@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -30,7 +31,10 @@ pub struct ProcessConfig {
 #[serde(untagged)]
 pub enum WatchConfig {
     Enabled(bool),
-    WithDebounce { debounce_seconds: Option<f64> },
+    WithOptions {
+        debounce_seconds: Option<f64>,
+        path: Option<String>,
+    },
 }
 
 impl Default for WatchConfig {
@@ -43,7 +47,7 @@ impl WatchConfig {
     pub fn is_enabled(&self) -> bool {
         match self {
             WatchConfig::Enabled(enabled) => *enabled,
-            WatchConfig::WithDebounce { .. } => true,
+            WatchConfig::WithOptions { .. } => true,
         }
     }
 
@@ -51,9 +55,28 @@ impl WatchConfig {
         match self {
             WatchConfig::Enabled(true) => Duration::from_secs(2),
             WatchConfig::Enabled(false) => Duration::from_secs(0),
-            WatchConfig::WithDebounce { debounce_seconds } => {
-                Duration::from_secs_f64(debounce_seconds.unwrap_or(1.0))
-            }
+            WatchConfig::WithOptions {
+                debounce_seconds, ..
+            } => Duration::from_secs_f64(debounce_seconds.unwrap_or(1.0)),
+        }
+    }
+
+    pub fn resolve_watch_path(&self) -> Option<PathBuf> {
+        let cwd = PathBuf::from(".");
+        match self {
+            WatchConfig::Enabled(true) => Some(cwd),
+            WatchConfig::Enabled(false) => None,
+            WatchConfig::WithOptions { path, .. } => match path {
+                Some(p) => {
+                    let path = PathBuf::from(p);
+                    if path.is_absolute() {
+                        Some(path)
+                    } else {
+                        Some(cwd.join(path))
+                    }
+                }
+                None => Some(cwd),
+            },
         }
     }
 }

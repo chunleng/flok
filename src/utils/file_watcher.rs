@@ -1,51 +1,13 @@
-use std::mem::discriminant;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::anyhow;
 use bus::{Bus, BusReader};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-
-pub static FILE_WATCHER: LazyLock<RwLock<FileWatcherStatus>> =
-    LazyLock::new(|| RwLock::new(FileWatcherStatus::Disabled));
-
-pub fn ensure_watcher_initialized() {
-    let is_init = match FILE_WATCHER.read() {
-        Ok(state) => match *state {
-            FileWatcherStatus::Disabled => false,
-            FileWatcherStatus::Enabled(_) => true,
-        },
-        _ => false,
-    };
-
-    if !is_init {
-        if let Ok(mut status) = FILE_WATCHER.write() {
-            if *status == FileWatcherStatus::Disabled {
-                let cwd = std::env::current_dir().unwrap();
-                let file_watcher = FileWatcher::new(&cwd)
-                    .map_err(|e| anyhow!("Failed to initialize file watcher: {}", e))
-                    .unwrap();
-                *status = FileWatcherStatus::Enabled(file_watcher);
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum WatcherEvent {
     FileChanged,
-}
-
-pub enum FileWatcherStatus {
-    Disabled,
-    Enabled(FileWatcher),
-}
-
-impl PartialEq for FileWatcherStatus {
-    fn eq(&self, other: &Self) -> bool {
-        discriminant(self) == discriminant(other)
-    }
 }
 
 pub struct FileWatcher {
